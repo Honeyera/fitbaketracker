@@ -1,0 +1,92 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: var(--t-bg);
+  --color-surface: var(--t-surface);
+  --color-card: var(--t-card);
+  --color-border: var(--t-border);
+  --color-text: var(--t-text);
+  --color-muted: var(--t-muted);
+  --color-accent: #3B82F6;
+  --color-accent-hover: #2563EB;
+  --color-brand: #E91E7B;
+  --color-brand-hover: #D1176E;
+  --color-hover: var(--t-hover);
+  --color-hover-strong: var(--t-hover-strong);
+  --color-overlay: var(--t-overlay);
+  --color-code-bg: var(--t-code-bg);
+  --font-sans: 'DM Sans', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+/* ── Dark theme (default) ───────────────────────────────── */
+
+:root, .theme-dark {
+  --t-bg: #0B0E11;
+  --t-surface: #141820;
+  --t-card: #171D28;
+  --t-border: #252D3A;
+  --t-text: #E8ECF1;
+  --t-muted: #7A8599;
+  --t-hover: rgba(255, 255, 255, 0.05);
+  --t-hover-strong: rgba(255, 255, 255, 0.1);
+  --t-overlay: rgba(0, 0, 0, 0.6);
+  --t-code-bg: rgba(0, 0, 0, 0.3);
+}
+
+/* ── Light theme ────────────────────────────────────────── */
+
+.theme-light {
+  --t-bg: #F5F7FA;
+  --t-surface: #FFFFFF;
+  --t-card: #FFFFFF;
+  --t-border: #E2E6EB;
+  --t-text: #1A1D21;
+  --t-muted: #6B7280;
+  --t-hover: rgba(0, 0, 0, 0.04);
+  --t-hover-strong: rgba(0, 0, 0, 0.08);
+  --t-overlay: rgba(0, 0, 0, 0.3);
+  --t-code-bg: rgba(0, 0, 0, 0.06);
+}
+
+/* ── Base ───────────────────────────────────────────────── */
+
+body {
+  margin: 0;
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* ── Animations ─────────────────────────────────────────── */
+
+@keyframes slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-slide-in {
+  animation: slide-in 0.25s ease-out;
+}
+
+@keyframes ai-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(233, 30, 123, 0.5); }
+  50% { box-shadow: 0 0 0 10px rgba(233, 30, 123, 0); }
+}
+
+.animate-ai-pulse {
+  animation: ai-pulse 2s ease-in-out 3;
+}
