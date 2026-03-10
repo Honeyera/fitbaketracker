@@ -16,13 +16,17 @@ import Modal from '../components/Modal'
 import ConfirmDialog from '../components/ConfirmDialog'
 import { PageSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/Toast'
-import { Plus, Star, Mail, Clock, CreditCard, Trash2, Download, Upload, X, Pencil, PackageSearch, FileDown, Printer } from 'lucide-react'
+import { Plus, Star, Mail, Clock, CreditCard, Trash2, Download, Upload, X, Pencil, PackageSearch, FileDown, Printer, ChevronDown } from 'lucide-react'
 import Papa from 'papaparse'
 import { generatePO_PDF, type POPDFData } from '../lib/generatePO_PDF'
 import SearchInput from '../components/SearchInput'
 import { useAuth } from '../contexts/AuthContext'
 import { logActivity } from '../lib/activityLog'
 import CostGuard from '../components/CostGuard'
+import SupplierPopover from '../components/SupplierPopover'
+import POPaymentSection from '../components/POPaymentSection'
+import CardUsedPicker from '../components/CardUsedPicker'
+import PaymentPopover from '../components/PaymentPopover'
 import type {
   Supplier,
   Ingredient,
@@ -44,7 +48,10 @@ import type {
   IngredientTagLink,
 } from '../types/database'
 import { nextShipmentNumber, findDefaultSI, findAllSIOptions, findSupplierOptions } from '../lib/mrp'
+import { processReceivedPOInventory } from '../lib/processReceivedPO'
 import { syncIngredientStatus } from '../lib/syncIngredientStatus'
+import { syncPOtoShipment, backfillShipmentTrackingToPOs } from '../lib/poShipmentSync'
+import { syncAfterPOStatusChange } from '../lib/poStatusChange'
 
 /* ────────── helpers ────────── */
 
@@ -77,14 +84,26 @@ const ORDER_TYPES = [
 
 const ORDER_TYPE_FILTERS = ['all', 'po', 'email', 'online', 'phone', 'standing_order'] as const
 
-const PAYMENT_METHODS = [
-  { value: 'credit_card', label: 'Credit Card' },
-  { value: 'ach', label: 'ACH / Bank Transfer' },
+const MELIO_FEE_PCT = 0.029
+
+const PAYMENT_TERMS_OPTIONS = [
+  { value: 'due_on_receipt', label: 'Due on Receipt' },
+  { value: 'prepaid', label: 'Prepaid' },
   { value: 'wire', label: 'Wire Transfer' },
+  { value: 'ach', label: 'ACH' },
   { value: 'check', label: 'Check' },
-  { value: 'net_terms', label: 'Net Terms' },
-  { value: 'other', label: 'Other' },
+  { value: 'credit_card', label: 'Credit Card' },
+  { value: 'melio', label: 'Melio' },
+  { value: 'cash', label: 'Cash' },
+  { value: 'net_15', label: 'Net 15' },
+  { value: 'net_20', label: 'Net 20' },
+  { value: 'net_30', label: 'Net 30' },
+  { value: 'net_45', label: 'Net 45' },
+  { value: 'net_60', label: 'Net 60' },
+  { value: 'net_90', label: 'Net 90' },
 ] as const
+
+const NET_TERM_VALUES = ['net_15', 'net_20', 'net_30', 'net_45', 'net_60', 'net_90']
 
 const PAYMENT_STATUSES = [
   { value: 'unpaid', label: 'Unpaid' },
@@ -203,6 +222,7 @@ interface PORow extends Record<string, unknown> {
   po_number: string
   order_type: string
   supplierName: string
+  supplier_id: string | null
   items: string
   total_cost: number | null
   shipping_cost: number | null
@@ -212,6 +232,11 @@ interface PORow extends Record<string, unknown> {
   order_date: string | null
   eta_date: string | null
   status: string
+  payment_method: string | null
+  payment_status: string | null
+  payment_due_date: string | null
+  card_used: string | null
+  amount_paid: number
   production_order_id: string | null
 }
 
@@ -278,9 +303,13 @@ export default function Suppliers() {
   const [prodOrderRuns, setProdOrderRuns] = useState<ProductionRun[]>([])
   const [prodOrderRecipeIngs, setProdOrderRecipeIngs] = useState<RecipeIngredient[]>([])
   const [poFilter, setPOFilter] = useState<string>('all')
+  const [poPaymentFilter, setPOPaymentFilter] = useState<string>('all')
   const [poTypeFilter, setPOTypeFilter] = useState<string>('all')
   const [supplierSearch, setSupplierSearch] = useState('')
   const [poSearch, setPOSearch] = useState('')
+  const [poViewMode, setPOViewMode] = useState<'list' | 'grouped'>('list')
+  const [poProdOrderFilter, setPOProdOrderFilter] = useState<string>('all')
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
 
   /* modals */
   const [poModalOpen, setPOModalOpen] = useState(false)
@@ -291,6 +320,7 @@ export default function Suppliers() {
   const [detailSupplier, setDetailSupplier] = useState<Supplier | null>(null)
   const [editForm, setEditForm] = useState({
     name: '', lead_time_days: '', payment_terms: '', rating: '', notes: '',
+    default_payment_method: '', default_card_used: '',
   })
   const [editContacts, setEditContacts] = useState<ContactRow[]>([])
   const [detailIngredients, setDetailIngredients] = useState<
@@ -339,7 +369,11 @@ export default function Suppliers() {
     tracking_number: '',
     notes: '',
     payment_method: '',
+    card_used: '',
     payment_status: 'unpaid',
+    payment_terms: '',
+    payment_due_date: '',
+    amount_paid: 0,
     shipping_cost: '',
     shipping_method: '',
     shipping_carrier: '',
@@ -360,11 +394,21 @@ export default function Suppliers() {
   const [poShippingCost, setPOShippingCost] = useState('')
   const [poShippingMethod, setPOShippingMethod] = useState('')
   const [poShippingCarrier, setPOShippingCarrier] = useState('')
+  const [poTrackingNumber, setPOTrackingNumber] = useState('')
   const [poIncludeShipping, setPOIncludeShipping] = useState(false)
   const [poInitialStatus, setPOInitialStatus] = useState<'draft' | 'ordered' | 'in_transit'>('draft')
   const [poProductionOrder, setPOProductionOrder] = useState('')
+  const [poPaymentMethod, setPOPaymentMethod] = useState('')
+  const [poCardUsed, setPOCardUsed] = useState('')
+  const [poNetTerms, setPONetTerms] = useState('net_30')
+  const [poPaymentDueDate, setPOPaymentDueDate] = useState('')
   /* price comparison popup */
   const [priceCompareIngId, setPriceCompareIngId] = useState<string | null>(null)
+
+  /* backfill inventory from received POs */
+  const [backfilling, setBackfilling] = useState(false)
+  const [backfillLog, setBackfillLog] = useState<string[]>([])
+  const [backfillConfirmOpen, setBackfillConfirmOpen] = useState(false)
 
   async function load() {
     const [supRes, ingRes, cpRes, siRes, scRes, poRes, poiRes, invRes, shipRes, convMap, prodOrderRes, tagRes, tagLinkRes] = await safeBatch(() => Promise.all([
@@ -399,6 +443,18 @@ export default function Suppliers() {
   }
 
   useEffect(() => safeLoad(load, setLoading), [])
+
+  // Backfill tracking from shipments → POs once on mount
+  const backfillRan = useRef(false)
+  useEffect(() => {
+    if (backfillRan.current) return
+    backfillRan.current = true
+    // Delay to let initial load finish first
+    const t = setTimeout(() => {
+      backfillShipmentTrackingToPOs().then((n) => { if (n > 0) load() })
+    }, 3000)
+    return () => clearTimeout(t)
+  }, [])
 
   /* ────── Fetch production runs + recipe ingredients for linked production order ────── */
   const activeProdOrderId = poProductionOrder || editPOForm.production_order_id
@@ -529,7 +585,8 @@ export default function Suppliers() {
 
   /* ────── PO table rows ────── */
 
-  const poRows: PORow[] = purchaseOrders
+  // Build rows before payment filter so we can compute payment stats
+  const poRowsPrePayment: PORow[] = purchaseOrders
     .filter((po) => poFilter === 'all' || po.status === poFilter)
     .filter((po) => poTypeFilter === 'all' || (po.order_type ?? 'po') === poTypeFilter)
     .map((po) => {
@@ -551,6 +608,7 @@ export default function Suppliers() {
         po_number: po.po_number,
         order_type: po.order_type ?? 'po',
         supplierName: sup?.name ?? '—',
+        supplier_id: po.supplier_id,
         items,
         total_cost: po.total_cost,
         shipping_cost: po.shipping_cost,
@@ -560,8 +618,44 @@ export default function Suppliers() {
         order_date: po.order_date,
         eta_date: po.eta_date,
         status: po.status ?? 'draft',
+        payment_method: po.payment_method ?? null,
+        payment_status: po.payment_status || 'unpaid',
+        payment_due_date: (po as any).payment_due_date ?? null,
+        card_used: (po as any).card_used ?? null,
+        amount_paid: (po as any).amount_paid ?? 0,
         production_order_id: po.production_order_id,
       }
+    })
+
+  // Payment filter stats (computed before applying payment filter)
+  const paymentFilterStats = (() => {
+    const now = new Date()
+    const cost = (r: PORow) => (r.total_cost as number) ?? 0
+    const isOverdue = (r: PORow) => r.payment_due_date && new Date(r.payment_due_date + 'T00:00:00') < now && (r.payment_status ?? 'unpaid') !== 'paid'
+    const unpaid = poRowsPrePayment.filter((r) => (r.payment_status ?? 'unpaid') === 'unpaid')
+    const partial = poRowsPrePayment.filter((r) => r.payment_status === 'partial')
+    const paid = poRowsPrePayment.filter((r) => r.payment_status === 'paid')
+    const overdue = poRowsPrePayment.filter(isOverdue)
+    return {
+      all: { count: poRowsPrePayment.length, total: poRowsPrePayment.reduce((s, r) => s + cost(r), 0) },
+      unpaid: { count: unpaid.length, total: unpaid.reduce((s, r) => s + cost(r), 0) },
+      partial: { count: partial.length, total: partial.reduce((s, r) => s + cost(r), 0) },
+      paid: { count: paid.length, total: paid.reduce((s, r) => s + cost(r), 0) },
+      overdue: { count: overdue.length, total: overdue.reduce((s, r) => s + cost(r), 0) },
+    }
+  })()
+
+  const poRows: PORow[] = poRowsPrePayment
+    .filter((row) => {
+      if (poPaymentFilter === 'all') return true
+      const ps = row.payment_status ?? 'unpaid'
+      if (poPaymentFilter === 'unpaid') return ps === 'unpaid'
+      if (poPaymentFilter === 'partial') return ps === 'partial'
+      if (poPaymentFilter === 'paid') return ps === 'paid'
+      if (poPaymentFilter === 'overdue') {
+        return row.payment_due_date && new Date(row.payment_due_date + 'T00:00:00') < new Date() && ps !== 'paid'
+      }
+      return true
     })
     .filter((row) => {
       if (!poSearch) return true
@@ -595,7 +689,18 @@ export default function Suppliers() {
       label: 'Supplier',
       key: 'supplierName',
       width: '160px',
-      render: (r) => <span className="text-[14px] text-text">{r.supplierName}</span>,
+      render: (r) => {
+        const sup = r.supplier_id ? suppliers.find((s) => s.id === r.supplier_id) : null
+        if (!sup) return <span className="text-[14px] text-text">{r.supplierName}</span>
+        return (
+          <SupplierPopover
+            supplier={sup}
+            contacts={supplierContacts.filter((c) => c.supplier_id === sup.id)}
+            poNumber={r.po_number}
+            onViewSupplier={() => setDetailSupplier(sup)}
+          />
+        )
+      },
     },
     {
       label: 'Items',
@@ -656,6 +761,62 @@ export default function Suppliers() {
       render: (r) => <span className="text-[14px] text-muted">{fmtDate(r.eta_date as string | null)}</span>,
     },
     {
+      label: 'Payment',
+      key: 'payment_status',
+      width: '120px',
+      align: 'center',
+      render: (r) => {
+        const ps = r.payment_status as string | null
+        const pm = r.payment_method as string | null
+        const card = r.card_used as string | null
+        const isNet = NET_TERM_VALUES.includes(pm ?? '')
+        const paid = r.amount_paid as number
+        const subtotal = r.total_cost as number ?? 0
+        const shipping = r.shipping_cost as number ?? 0
+        const grandTotal = subtotal + shipping
+
+        let display: React.ReactNode
+        if (!ps || ps === 'unpaid') {
+          if (isNet && r.payment_due_date) {
+            const today = new Date(); today.setHours(0,0,0,0)
+            const due = new Date((r.payment_due_date as string) + 'T00:00:00')
+            if (due < today) {
+              display = <span className="text-red-400 font-medium text-[13px]">Overdue ⚠</span>
+            } else {
+              display = <span className="text-muted text-[13px]">Due {fmtDate(r.payment_due_date as string)}</span>
+            }
+          }
+          if (!display) display = <span className="text-red-400 text-[13px]">Unpaid</span>
+        } else if (ps === 'partial') {
+          display = <span className="text-amber-400 font-medium text-[13px]">{fmt$(paid)} paid</span>
+        } else if (ps === 'paid') {
+          display = <span className="text-emerald-400 font-medium text-[13px]">Paid ✓</span>
+        } else {
+          display = <span className="text-muted text-[13px]">{ps}</span>
+        }
+
+        return (
+          <PaymentPopover
+            poId={r.id}
+            poNumber={r.po_number}
+            supplierName={r.supplierName}
+            subtotal={subtotal}
+            shippingCost={shipping}
+            amountPaid={paid}
+            paymentStatus={ps || 'unpaid'}
+            paymentMethod={pm}
+            onDone={load}
+          >
+            <div className="flex flex-col items-center gap-0.5 rounded-lg px-2 py-1 transition-colors hover:bg-hover-strong">
+              {display}
+              {(pm === 'credit_card' || pm === 'melio') && card && <span className="text-[11px] text-muted/70">{card}</span>}
+              {pm === 'melio' && <span className="text-[11px]" style={{ color: '#E91E7B' }}>+2.9% fee</span>}
+            </div>
+          </PaymentPopover>
+        )
+      },
+    },
+    {
       label: 'Status',
       key: 'status',
       width: '120px',
@@ -693,6 +854,156 @@ export default function Suppliers() {
       ),
     },
   ]
+
+  /* ────── Grouped view data ────── */
+
+  const STATUS_SORT_ORDER: Record<string, number> = { ordered: 0, in_transit: 1, draft: 2, received: 3, cancelled: 4 }
+
+  const ORDER_STATUS_BORDER: Record<string, string> = {
+    draft: '#6B7280',
+    sent_to_cp: '#3B82F6',
+    confirmed_by_cp: '#8B5CF6',
+    in_production: '#F59E0B',
+    completed: '#10B981',
+    shipped: '#06B6D4',
+    on_hold: '#EF4444',
+    cancelled: '#991B1B',
+    // Legacy compat
+    sent: '#3B82F6',
+    complete: '#22C55E',
+  }
+
+  const ORDER_STATUS_LABEL: Record<string, string> = {
+    draft: 'Draft',
+    sent_to_cp: 'Sent to CP',
+    confirmed_by_cp: 'Confirmed by CP',
+    in_production: 'In Production',
+    completed: 'Completed',
+    shipped: 'Shipped',
+    on_hold: 'On Hold',
+    cancelled: 'Cancelled',
+    // Legacy compat
+    sent: 'Sent',
+    complete: 'Complete',
+  }
+
+  interface POGroup {
+    key: string  // production_order_id or '__standalone__'
+    order: ProductionOrder | null
+    cpName: string
+    pos: PORow[]
+    totalValue: number
+    receivedValue: number
+    receivedCount: number
+    flavorCount: number
+    totalUnits: number | null
+  }
+
+  const poGroups: POGroup[] = (() => {
+    // Apply prod order filter
+    const filteredRows = poProdOrderFilter === 'all'
+      ? poRows
+      : poProdOrderFilter === '__standalone__'
+        ? poRows.filter((r) => !r.production_order_id)
+        : poRows.filter((r) => r.production_order_id === poProdOrderFilter)
+
+    // Group POs by production_order_id
+    const map = new Map<string, PORow[]>()
+    for (const row of filteredRows) {
+      const key = row.production_order_id ?? '__standalone__'
+      const arr = map.get(key)
+      if (arr) arr.push(row)
+      else map.set(key, [row])
+    }
+
+    const groups: POGroup[] = []
+
+    // Sort POs within each group by status priority
+    const sortPOs = (arr: PORow[]) =>
+      [...arr].sort((a, b) => (STATUS_SORT_ORDER[a.status] ?? 9) - (STATUS_SORT_ORDER[b.status] ?? 9))
+
+    for (const [key, rows] of map.entries()) {
+      if (key === '__standalone__') continue
+      const order = productionOrders.find((o) => o.id === key) ?? null
+      const cp = order?.co_packer_id ? coPackers.find((c) => c.id === order.co_packer_id) : null
+      const sorted = sortPOs(rows)
+      const totalValue = sorted.reduce((s, r) => s + ((r.total_cost as number) ?? 0), 0)
+      const receivedRows = sorted.filter((r) => r.status === 'received')
+      const receivedValue = receivedRows.reduce((s, r) => s + ((r.total_cost as number) ?? 0), 0)
+      // Count flavors from production_runs fetched on demand — fallback to total_units from order
+      const flavorCount = order?.total_units != null ? 0 : 0  // We'll use run data if available
+      groups.push({
+        key,
+        order,
+        cpName: cp?.name ?? '',
+        pos: sorted,
+        totalValue,
+        receivedValue,
+        receivedCount: receivedRows.length,
+        flavorCount,
+        totalUnits: order?.total_units ?? null,
+      })
+    }
+
+    // Sort groups by order date (newest first)
+    groups.sort((a, b) => {
+      const da = a.order?.order_date ?? ''
+      const db = b.order?.order_date ?? ''
+      return db.localeCompare(da)
+    })
+
+    // Standalone group at the end
+    const standalone = map.get('__standalone__')
+    if (standalone && standalone.length > 0) {
+      const sorted = sortPOs(standalone)
+      const totalValue = sorted.reduce((s, r) => s + ((r.total_cost as number) ?? 0), 0)
+      const receivedRows = sorted.filter((r) => r.status === 'received')
+      groups.push({
+        key: '__standalone__',
+        order: null,
+        cpName: '',
+        pos: sorted,
+        totalValue,
+        receivedValue: receivedRows.reduce((s, r) => s + ((r.total_cost as number) ?? 0), 0),
+        receivedCount: receivedRows.length,
+        flavorCount: 0,
+        totalUnits: null,
+      })
+    }
+
+    return groups
+  })()
+
+  /* ────── PO summary stats ────── */
+
+  const poSummaryStats = (() => {
+    const prodOrderIds = new Set(poRows.filter((r) => r.production_order_id).map((r) => r.production_order_id!))
+    const totalValue = poRows.reduce((s, r) => s + ((r.total_cost as number) ?? 0), 0)
+    return {
+      prodOrderCount: prodOrderIds.size,
+      totalPOs: poRows.length,
+      received: poRows.filter((r) => r.status === 'received').length,
+      inTransit: poRows.filter((r) => r.status === 'in_transit').length,
+      ordered: poRows.filter((r) => r.status === 'ordered').length,
+      totalValue,
+    }
+  })()
+
+  function toggleGroup(key: string) {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  /* ────── Production orders that have POs linked (for the prod-order filter dropdown) ────── */
+
+  const prodOrdersWithPOs = (() => {
+    const ids = new Set(purchaseOrders.map((p) => p.production_order_id).filter(Boolean) as string[])
+    return productionOrders.filter((o) => ids.has(o.id)).sort((a, b) => (b.order_date ?? '').localeCompare(a.order_date ?? ''))
+  })()
 
   async function handleStatusChange(poId: string, newStatus: string) {
     if (newStatus === 'cancelled') {
@@ -788,127 +1099,33 @@ export default function Suppliers() {
           await createShipmentForPO('received', today)
         }
 
-        // ── Existing inventory/cost logic (unchanged) ──
-        // Pre-compute shipping allocation per item (in inventory units) if "include shipping" is on
-        const shippingAlloc = new Map<string, number>()
-        if (po.include_shipping_in_cost && po.shipping_cost && po.shipping_cost > 0) {
-          const totalValue = items.reduce((s, it) => s + it.quantity * it.unit_cost, 0)
-          for (const it of items) {
-            if (!it.ingredient_id || totalValue <= 0) continue
-            const lineValue = it.quantity * it.unit_cost
-            const allocated = po.shipping_cost * (lineValue / totalValue)
-            const recQty = it.received_quantity ?? it.quantity
-            const ing2 = ingredients.find((i) => i.id === it.ingredient_id)
-            const lu = it.quantity_unit ?? ing2?.unit ?? 'lbs'
-            const iu = ing2?.unit ?? 'lbs'
-            let qtyInIU = recQty
-            if (normalizeUnit(lu) !== normalizeUnit(iu)) {
-              try {
-                const f = getConversionFactorWithDensity(conversions, lu, iu, ing2?.density_g_per_ml)
-                qtyInIU = recQty * f
-              } catch { /* use unconverted */ }
-            }
-            if (qtyInIU > 0) shippingAlloc.set(it.ingredient_id, allocated / qtyInIU)
-          }
-        }
-
-        for (const item of items) {
-          if (!item.ingredient_id) continue
-          const receivedQty = item.received_quantity ?? item.quantity
-          if (receivedQty <= 0) continue
-
-          const ing = ingredients.find((i) => i.id === item.ingredient_id)
-          if (!ing) continue
-
-          // Convert from PO line unit to ingredient's inventory unit
-          const lineUnit = item.quantity_unit ?? ing.unit
-          const invUnit = ing.unit
-          const needsConversion = normalizeUnit(lineUnit) !== normalizeUnit(invUnit)
-
-          let receivedInInvUnit = receivedQty
-          let costInInvUnit = item.unit_cost
-          if (needsConversion) {
-            try {
-              const factor = getConversionFactorWithDensity(conversions, lineUnit, invUnit, ing.density_g_per_ml)
-              receivedInInvUnit = Math.round(receivedQty * factor * 10000) / 10000
-              costInInvUnit = Math.round((item.unit_cost / factor) * 10000) / 10000
-            } catch (err) {
-              console.warn(`Unit conversion failed for ${ing.name}: ${lineUnit} → ${invUnit}`, err)
-            }
-          }
-
-          // Add shipping allocation to cost (already in inv units)
-          const shippingAddon = shippingAlloc.get(item.ingredient_id) ?? 0
-          const effectiveCost = costInInvUnit + shippingAddon
-
-          // a. Get current total quantity across ALL locations (in inventory units)
-          const currentTotalQty = inventory
-            .filter((iv) => iv.ingredient_id === item.ingredient_id)
-            .reduce((s, iv) => s + (iv.quantity ?? 0), 0)
-
-          // b+c. Calculate new weighted average cost (in inventory units)
-          const currentValue = currentTotalQty * ing.unit_cost
-          const newValue = receivedInInvUnit * effectiveCost
-          const newTotalQty = currentTotalQty + receivedInInvUnit
-          const newUnitCost = newTotalQty > 0
-            ? Math.round(((currentValue + newValue) / newTotalQty) * 10000) / 10000
-            : effectiveCost
-
-          // d. Update ingredient: weighted avg cost + last_cost (in inventory units)
-          await dbUpdate('ingredients', sanitize('ingredients', {
-            unit_cost: newUnitCost,
-            last_cost: effectiveCost,
-          }), 'id', item.ingredient_id)
-
-          // e. Add received quantity (in inventory units) to inventory at destination
-          const locationType = 'copacker'
-          const cpId = po.destination_co_packer_id
-
-          const existingInv = inventory.find(
-            (iv) =>
-              iv.ingredient_id === item.ingredient_id &&
-              iv.location_type === locationType &&
-              iv.co_packer_id === cpId,
-          )
-
-          if (existingInv) {
-            await dbUpdate('ingredient_inventory',
-              sanitize('ingredient_inventory', {
-                quantity: (existingInv.quantity ?? 0) + receivedInInvUnit,
-                updated_at: new Date().toISOString(),
-              }),
-            'id', existingInv.id)
-          } else {
-            await dbInsert('ingredient_inventory',
-              sanitize('ingredient_inventory', {
-                ingredient_id: item.ingredient_id,
-                location_type: locationType,
-                co_packer_id: cpId,
-                quantity: receivedInInvUnit,
-                updated_at: new Date().toISOString(),
-              }),
-            )
-          }
-
-          // f. Log cost history (in inventory units, includes shipping if applicable)
-          await dbInsert('ingredient_cost_history', sanitize('ingredient_cost_history', {
-            ingredient_id: item.ingredient_id,
-            purchase_order_id: poId,
-            unit_cost: effectiveCost,
-            quantity: receivedInInvUnit,
-            date: today,
-          }))
-        }
+        // Process inventory + cost updates (with double-processing guard)
+        const result = await processReceivedPOInventory(poId, conversions)
 
         await dbUpdate('purchase_orders', sanitize('purchase_orders', { status: newStatus }), 'id', poId)
         const cpName = coPackers.find((c) => c.id === po.destination_co_packer_id)?.name ?? 'co-packer'
-        toast.success(`PO ${po.po_number} received — Inventory added to ${cpName}`)
+        if (result.skipped) {
+          toast.success(`PO ${po.po_number} marked received (inventory already processed)`)
+        } else if (result.errors.length > 0) {
+          toast.success(`PO ${po.po_number} received — ${result.processed} items to ${cpName}, ${result.errors.length} errors`)
+          console.warn('PO received errors:', result.errors)
+        } else {
+          toast.success(`PO ${po.po_number} received — ${result.processed} items added to ${cpName}`)
+        }
       } else {
         // Generic status update (e.g. draft)
         await dbUpdate('purchase_orders', sanitize('purchase_orders', { status: newStatus }), 'id', poId)
       }
 
-      if (po.production_order_id) syncIngredientStatus(po.production_order_id)
+      // Full sync chain: shipment + ingredient status (non-blocking)
+      // For ordered/in_transit/received, shipments are already managed directly above,
+      // so skipShipmentSync. For other statuses (draft), let it handle shipment sync.
+      const directlyHandled = newStatus === 'ordered' || newStatus === 'in_transit' || newStatus === 'received'
+      syncAfterPOStatusChange(poId, newStatus, {
+        productionOrderId: po.production_order_id,
+        skipShipmentSync: directlyHandled,
+      }).then((msg) => { if (msg) toast.info(msg) })
+
       load()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to update status')
@@ -920,12 +1137,75 @@ export default function Suppliers() {
     try {
       const cancelledPO = purchaseOrders.find((p) => p.id === pendingCancelId)
       await dbUpdate('purchase_orders', sanitize('purchase_orders', { status: 'cancelled' }), 'id', pendingCancelId)
-      if (cancelledPO?.production_order_id) syncIngredientStatus(cancelledPO.production_order_id)
+      syncAfterPOStatusChange(pendingCancelId, 'cancelled', {
+        productionOrderId: cancelledPO?.production_order_id ?? null,
+      })
       setConfirmCancelOpen(false)
       setPendingCancelId(null)
       load()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to cancel PO')
+    }
+  }
+
+  /* ────── Backfill inventory from received POs ────── */
+
+  async function backfillInventory() {
+    setBackfilling(true)
+    setBackfillLog([])
+    const log = (msg: string) => setBackfillLog((prev) => [...prev, msg])
+
+    try {
+      const { data: receivedPOs } = await supabase
+        .from('purchase_orders')
+        .select('id, po_number')
+        .eq('status', 'received')
+        .order('order_date')
+
+      if (!receivedPOs || receivedPOs.length === 0) {
+        log('No received POs found.')
+        return
+      }
+
+      log(`Found ${receivedPOs.length} received PO(s). Checking each...`)
+      let processed = 0
+      let skipped = 0
+      let errCount = 0
+
+      for (let i = 0; i < receivedPOs.length; i++) {
+        const po = receivedPOs[i]
+        log(`[${i + 1}/${receivedPOs.length}] ${po.po_number}...`)
+
+        const result = await processReceivedPOInventory(po.id, conversions)
+        if (result.skipped) {
+          log(`  ↳ Already processed, skipping`)
+          skipped++
+        } else if (result.processed > 0) {
+          log(`  ↳ Added ${result.processed} item(s) to inventory`)
+          processed++
+        } else if (result.errors.length > 0) {
+          log(`  ↳ Errors: ${result.errors.join('; ')}`)
+          errCount++
+        } else {
+          log(`  ↳ No items to process`)
+          skipped++
+        }
+      }
+
+      log('')
+      log(`═══ COMPLETE ═══`)
+      log(`Processed: ${processed} | Already done: ${skipped} | Errors: ${errCount}`)
+      if (processed > 0) {
+        toast.success(`Inventory updated from ${processed} PO(s)`)
+        load()
+      } else {
+        toast.info('All received POs were already processed')
+      }
+    } catch (err) {
+      log(`ERROR: ${err instanceof Error ? err.message : 'Unknown error'}`)
+      toast.error('Backfill failed')
+    } finally {
+      setBackfilling(false)
     }
   }
 
@@ -946,7 +1226,11 @@ export default function Suppliers() {
       tracking_number: po.tracking_number ?? '',
       notes: po.notes ?? '',
       payment_method: po.payment_method ?? '',
+      card_used: (po as any).card_used ?? '',
       payment_status: po.payment_status ?? 'unpaid',
+      payment_terms: (po as any).payment_terms ?? '',
+      payment_due_date: (po as any).payment_due_date ?? '',
+      amount_paid: (po as any).amount_paid ?? 0,
       shipping_cost: po.shipping_cost != null ? String(po.shipping_cost) : '',
       shipping_method: po.shipping_method ?? '',
       shipping_carrier: po.shipping_carrier ?? '',
@@ -1124,10 +1408,15 @@ export default function Suppliers() {
         destination_co_packer_id: editPOForm.destination_co_packer_id || null,
         tracking_number: editPOForm.tracking_number || null,
         notes: editPOForm.notes || null,
-        total_cost: safeTotalCost,
+        total_cost: safeTotalCost + (editPOForm.payment_method === 'melio' ? parseFloat((safeTotalCost * MELIO_FEE_PCT).toFixed(2)) : 0),
+        processing_fee: editPOForm.payment_method === 'melio' ? parseFloat((safeTotalCost * MELIO_FEE_PCT).toFixed(2)) : 0,
         order_reference: editPOForm.order_reference || null,
         payment_method: editPOForm.payment_method || null,
-        payment_status: editPOForm.payment_status,
+        card_used: (editPOForm.payment_method === 'credit_card' || editPOForm.payment_method === 'melio') ? (editPOForm.card_used || null) : null,
+        payment_terms: NET_TERM_VALUES.includes(editPOForm.payment_method) ? (editPOForm.payment_terms || editPOForm.payment_method) : null,
+        payment_due_date: NET_TERM_VALUES.includes(editPOForm.payment_method) ? (editPOForm.payment_due_date || null) : null,
+        payment_status: editPOForm.payment_status || 'unpaid',
+        amount_paid: NET_TERM_VALUES.includes(editPOForm.payment_method) ? editPOForm.amount_paid : 0,
         shipping_cost: editPOForm.shipping_cost ? Number(editPOForm.shipping_cost) : null,
         shipping_method: editPOForm.shipping_method || null,
         shipping_carrier: editPOForm.shipping_carrier || null,
@@ -1197,6 +1486,20 @@ export default function Suppliers() {
       }
 
       console.log('[DEBUG] Step 3: All saved, closing modal...')
+
+      // Sync shared fields to linked shipment (tracking, carrier, cost — non-blocking)
+      syncPOtoShipment(editPO.id, {
+        tracking_number: editPOForm.tracking_number || null,
+        shipping_carrier: editPOForm.shipping_carrier || null,
+        shipping_cost: editPOForm.shipping_cost ? Number(editPOForm.shipping_cost) : null,
+      }).then((msg) => { if (msg) toast.info(msg) })
+
+      // Full PO status sync chain: shipment status + ingredient status (non-blocking)
+      const prodOrderId = editPOForm.production_order_id || editPO.production_order_id
+      syncAfterPOStatusChange(editPO.id, editPOForm.status, {
+        productionOrderId: prodOrderId ?? null,
+      }).then((msg) => { if (msg) toast.info(msg) })
+
       toast.success('Purchase order updated')
       logActivity(appUser?.id, 'update_po', 'purchase_order', editPO.id)
       setEditPO(null)
@@ -1867,6 +2170,10 @@ When done, save as CSV and send back for import.
     setPOIncludeShipping(false)
     setPOInitialStatus('draft')
     setPOProductionOrder('')
+    setPOPaymentMethod('')
+    setPOCardUsed('')
+    setPONetTerms('net_30')
+    setPOPaymentDueDate('')
   }
 
   function addLine() {
@@ -1876,6 +2183,26 @@ When done, save as CSV and send back for import.
   function handleSupplierChange(newSupplierId: string) {
     const oldSupplierId = poSupplier
     setPOSupplier(newSupplierId)
+    // Auto-fill payment method from supplier default
+    if (newSupplierId) {
+      const sup = suppliers.find((s) => s.id === newSupplierId)
+      const defMethod = (sup as any)?.default_payment_method
+      if (defMethod) {
+        setPOPaymentMethod(defMethod)
+        const defCard = (sup as any)?.default_card_used
+        if (defCard && (defMethod === 'credit_card' || defMethod === 'melio')) {
+          setPOCardUsed(defCard)
+        } else {
+          setPOCardUsed('')
+        }
+        // Auto-calc due date for net terms
+        if (NET_TERM_VALUES.includes(defMethod) && poOrderDate) {
+          const days: Record<string, number> = { net_15: 15, net_20: 20, net_30: 30, net_45: 45, net_60: 60, net_90: 90 }
+          const d = new Date(poOrderDate + 'T00:00:00')
+          if (days[defMethod]) { d.setDate(d.getDate() + days[defMethod]); setPOPaymentDueDate(d.toISOString().split('T')[0]) }
+        }
+      }
+    }
     if (!newSupplierId || poLines.every((l) => !l.ingredient_id)) return
     // Recalculate prices for all lines with ingredients
     let changed = false
@@ -2109,13 +2436,19 @@ When done, save as CSV and send back for import.
         eta_date: poEtaDate || null,
         destination_type: 'copacker',
         destination_co_packer_id: poDestCP || null,
-        total_cost: safeTotalCost,
+        total_cost: safeTotalCost + (poPaymentMethod === 'melio' ? parseFloat((safeTotalCost * MELIO_FEE_PCT).toFixed(2)) : 0),
+        processing_fee: poPaymentMethod === 'melio' ? parseFloat((safeTotalCost * MELIO_FEE_PCT).toFixed(2)) : 0,
         shipping_cost: poShippingCost ? Number(poShippingCost) : null,
         shipping_method: poShippingMethod || null,
         shipping_carrier: poShippingCarrier || null,
         shipping_per_unit_weight: poShippingCost ? computeCreateShippingPerWeight() : null,
         include_shipping_in_cost: poIncludeShipping,
         production_order_id: poProductionOrder || null,
+        payment_method: poPaymentMethod || null,
+        card_used: (poPaymentMethod === 'credit_card' || poPaymentMethod === 'melio') ? (poCardUsed || null) : null,
+        payment_terms: NET_TERM_VALUES.includes(poPaymentMethod) ? poPaymentMethod : null,
+        payment_due_date: NET_TERM_VALUES.includes(poPaymentMethod) ? (poPaymentDueDate || null) : null,
+        payment_status: 'unpaid',
       }
 
       console.log('[DEBUG] Step 1: Inserting PO header...')
@@ -2277,6 +2610,8 @@ When done, save as CSV and send back for import.
       payment_terms: sup.payment_terms ?? '',
       rating: sup.rating != null ? String(sup.rating) : '',
       notes: sup.notes ?? '',
+      default_payment_method: (sup as any).default_payment_method ?? '',
+      default_card_used: (sup as any).default_card_used ?? '',
     })
     setEditContacts(
       supplierContacts
@@ -2436,6 +2771,8 @@ When done, save as CSV and send back for import.
         payment_terms: editForm.payment_terms || null,
         rating: editForm.rating ? Number(editForm.rating) : null,
         notes: editForm.notes || null,
+        default_payment_method: editForm.default_payment_method || null,
+        default_card_used: (editForm.default_payment_method === 'credit_card' || editForm.default_payment_method === 'melio') ? (editForm.default_card_used || null) : null,
       })
       dbg('Payload: ' + JSON.stringify(supplierPayload))
 
@@ -2548,6 +2885,14 @@ When done, save as CSV and send back for import.
       {/* ── SECTION 1: Purchase Orders ── */}
       <PageHeader title="Purchase Orders" subtitle="Track orders from ingredient suppliers">
         <button
+          onClick={() => setBackfillConfirmOpen(true)}
+          className="flex items-center gap-2 rounded-lg border border-border px-4 py-2 text-[14px] font-medium text-muted transition-colors hover:text-text hover:bg-hover"
+          title="Add inventory from received POs that were never processed"
+        >
+          <PackageSearch size={16} />
+          Backfill Inventory
+        </button>
+        <button
           onClick={handleExportCSV}
           className="flex items-center gap-2 rounded-lg border border-border px-4 py-2 text-[14px] font-medium text-muted transition-colors hover:text-text hover:bg-hover"
         >
@@ -2563,8 +2908,46 @@ When done, save as CSV and send back for import.
         </button>
       </PageHeader>
 
-      {/* Status filter pills + search */}
+      {/* Summary stats */}
+      <div className="mb-4 flex flex-wrap items-center gap-4 text-[13px]">
+        <CostGuard>
+          <span className="text-muted">Total Value: <span className="font-mono font-semibold text-text">{fmt$(poSummaryStats.totalValue)}</span></span>
+        </CostGuard>
+        <span className="h-3 w-px bg-border" />
+        {poSummaryStats.prodOrderCount > 0 && (
+          <span className="text-muted">Prod Orders: <span className="font-semibold text-text">{poSummaryStats.prodOrderCount}</span></span>
+        )}
+        <span className="text-muted">Total POs: <span className="font-semibold text-text">{poSummaryStats.totalPOs}</span></span>
+        {poSummaryStats.received > 0 && (
+          <span className="flex items-center gap-1.5 text-muted"><span className="inline-block h-2 w-2 rounded-full" style={{ background: '#22C55E' }} />{poSummaryStats.received} Received</span>
+        )}
+        {poSummaryStats.inTransit > 0 && (
+          <span className="flex items-center gap-1.5 text-muted"><span className="inline-block h-2 w-2 rounded-full" style={{ background: '#06B6D4' }} />{poSummaryStats.inTransit} In Transit</span>
+        )}
+        {poSummaryStats.ordered > 0 && (
+          <span className="flex items-center gap-1.5 text-muted"><span className="inline-block h-2 w-2 rounded-full" style={{ background: '#3B82F6' }} />{poSummaryStats.ordered} Ordered</span>
+        )}
+      </div>
+
+      {/* View toggle + Status filter pills + search */}
       <div className="mb-4 flex flex-wrap items-center gap-3">
+        {/* View mode */}
+        <div className="flex items-center rounded-lg border border-border overflow-hidden">
+          <button
+            onClick={() => setPOViewMode('list')}
+            className={`px-3 py-1.5 text-[13px] font-medium transition-colors ${poViewMode === 'list' ? 'bg-accent text-white' : 'text-muted hover:text-text hover:bg-hover'}`}
+          >
+            List
+          </button>
+          <button
+            onClick={() => setPOViewMode('grouped')}
+            className={`px-3 py-1.5 text-[13px] font-medium transition-colors ${poViewMode === 'grouped' ? 'bg-accent text-white' : 'text-muted hover:text-text hover:bg-hover'}`}
+          >
+            By Prod Order
+          </button>
+        </div>
+        <div className="h-5 w-px bg-border" />
+        {/* Status filter */}
         <div className="flex items-center gap-2">
           {PO_FILTERS.map((f) => (
             <button
@@ -2581,6 +2964,7 @@ When done, save as CSV and send back for import.
           ))}
         </div>
         <div className="h-5 w-px bg-border" />
+        {/* Type filter */}
         <div className="flex items-center gap-2">
           {ORDER_TYPE_FILTERS.map((f) => {
             const meta = ORDER_TYPES.find((t) => t.value === f)
@@ -2599,6 +2983,24 @@ When done, save as CSV and send back for import.
             )
           })}
         </div>
+        {/* Prod-order filter (grouped view) */}
+        {poViewMode === 'grouped' && prodOrdersWithPOs.length > 0 && (
+          <>
+            <div className="h-5 w-px bg-border" />
+            <select
+              value={poProdOrderFilter}
+              onChange={(e) => setPOProdOrderFilter(e.target.value)}
+              className="rounded-lg border border-border bg-surface px-3 py-1.5 text-[14px] text-text outline-none focus:border-accent"
+            >
+              <option value="all">All Prod Orders</option>
+              {prodOrdersWithPOs.map((o) => {
+                const cp = o.co_packer_id ? coPackers.find((c) => c.id === o.co_packer_id) : null
+                return <option key={o.id} value={o.id}>{o.order_number}{cp ? ` — ${cp.name}` : ''}</option>
+              })}
+              <option value="__standalone__">Standalone POs only</option>
+            </select>
+          </>
+        )}
         <div className="w-64">
           <SearchInput
             placeholder="Search orders..."
@@ -2609,13 +3011,208 @@ When done, save as CSV and send back for import.
         </div>
       </div>
 
-      <DataTable
-        columns={poColumns}
-        data={poRows}
-        onRowClick={openEditPO}
-        emptyMessage="No purchase orders"
-        emptyHint="Create your first PO to track orders"
-      />
+      {/* Payment filter row */}
+      <div className="mb-4 flex items-center gap-2">
+        <span className="text-[13px] font-medium text-muted mr-1">Payment:</span>
+        {(['all', 'unpaid', 'partial', 'paid', 'overdue'] as const).map((f) => {
+          const stats = paymentFilterStats[f]
+          const isActive = poPaymentFilter === f
+          const fmtAmt = (n: number) => n >= 1000 ? `$${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `$${Math.round(n).toLocaleString()}`
+          let activeClass = 'bg-accent text-white'
+          if (isActive && f === 'paid') activeClass = 'bg-emerald-600 text-white'
+          else if (isActive && f === 'unpaid') activeClass = 'bg-red-600 text-white'
+          else if (isActive && f === 'partial') activeClass = 'bg-amber-600 text-white'
+          else if (isActive && f === 'overdue') activeClass = 'bg-red-700 text-white'
+          const overdueHighlight = f === 'overdue' && !isActive && stats.count > 0
+            ? 'border-red-400 text-red-400 hover:bg-red-500/10'
+            : ''
+          return (
+            <button
+              key={f}
+              onClick={() => setPOPaymentFilter(f)}
+              className={`rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors ${
+                isActive
+                  ? activeClass
+                  : overdueHighlight || 'border border-border text-muted hover:text-text hover:bg-hover'
+              }${!isActive && !overdueHighlight ? ' border' : overdueHighlight && !isActive ? ' border' : ''}`}
+            >
+              {f === 'all' ? `All (${stats.count})` : (
+                <>
+                  {f.charAt(0).toUpperCase() + f.slice(1)} ({stats.count})
+                  {stats.count > 0 && f !== 'all' && <span className="ml-1 opacity-75">{fmtAmt(stats.total)}</span>}
+                </>
+              )}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* ── List view ── */}
+      {poViewMode === 'list' && (
+        <DataTable
+          columns={poColumns}
+          data={poRows}
+          onRowClick={openEditPO}
+          emptyMessage="No purchase orders"
+          emptyHint="Create your first PO to track orders"
+        />
+      )}
+
+      {/* ── Grouped view ── */}
+      {poViewMode === 'grouped' && (
+        <div className="space-y-4">
+          {poGroups.length === 0 && (
+            <div className="rounded-xl border border-border px-4 py-12 text-center">
+              <p className="text-[16px] font-medium text-muted">No purchase orders match your filters</p>
+            </div>
+          )}
+          {poGroups.map((group) => {
+            const isStandalone = group.key === '__standalone__'
+            const collapsed = collapsedGroups.has(group.key)
+            const orderStatus = group.order?.status ?? 'draft'
+            const borderColor = ORDER_STATUS_BORDER[orderStatus] ?? '#7A8599'
+            const pctReceived = group.totalValue > 0 ? (group.receivedValue / group.totalValue) * 100 : 0
+
+            return (
+              <div
+                key={group.key}
+                className="rounded-xl border border-border overflow-hidden"
+                style={{ borderLeftWidth: 4, borderLeftColor: isStandalone ? '#7A8599' : borderColor }}
+              >
+                {/* Group header */}
+                <button
+                  type="button"
+                  onClick={() => toggleGroup(group.key)}
+                  className="w-full text-left px-4 py-3 bg-surface/60 hover:bg-hover transition-colors"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <ChevronDown
+                        size={16}
+                        className="shrink-0 text-muted transition-transform duration-200"
+                        style={{ transform: collapsed ? 'rotate(-90deg)' : 'rotate(0deg)' }}
+                      />
+                      {isStandalone ? (
+                        <span className="text-[15px] font-semibold text-muted">Standalone POs (no production order)</span>
+                      ) : (
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[15px] font-semibold text-text">{group.order?.order_number ?? '—'}</span>
+                            {group.cpName && <span className="text-[14px] text-muted">— {group.cpName}</span>}
+                            <span
+                              className="inline-flex items-center rounded-full px-2.5 py-0.5 text-[11px] font-medium"
+                              style={{ backgroundColor: `${borderColor}1F`, color: borderColor }}
+                            >
+                              {ORDER_STATUS_LABEL[orderStatus] ?? orderStatus}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-3 mt-0.5 text-[13px] text-muted">
+                            {group.totalUnits != null && (
+                              <span>{group.totalUnits.toLocaleString()} units</span>
+                            )}
+                            <CostGuard><span>Total PO Value: <span className="font-mono font-semibold text-text">{fmt$(group.totalValue)}</span></span></CostGuard>
+                            <span>{group.pos.length} Purchase Order{group.pos.length !== 1 ? 's' : ''}</span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    {!isStandalone && (
+                      <div className="flex items-center gap-3 shrink-0 ml-4">
+                        <span className="text-[13px] text-muted">{group.receivedCount}/{group.pos.length} received</span>
+                        {/* Progress dots */}
+                        <div className="flex items-center gap-1">
+                          {group.pos.map((po, i) => (
+                            <span
+                              key={i}
+                              className="inline-block h-2.5 w-2.5 rounded-full"
+                              title={`${po.po_number}: ${STATUS_LABELS[po.status] ?? po.status}`}
+                              style={{
+                                background: po.status === 'received' ? '#22C55E'
+                                  : po.status === 'in_transit' ? '#06B6D4'
+                                  : po.status === 'ordered' ? '#3B82F6'
+                                  : '#7A8599',
+                              }}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </button>
+
+                {/* Group body — PO table */}
+                {!collapsed && (
+                  <div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-[14px]">
+                        <thead>
+                          <tr className="border-b border-t border-border bg-surface">
+                            {poColumns.map((col) => (
+                              <th
+                                key={col.key}
+                                className="px-4 py-2.5 text-left text-[12px] font-semibold uppercase tracking-wider text-muted"
+                                style={{ width: col.width, textAlign: col.align ?? 'left' }}
+                              >
+                                {col.label}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {group.pos.map((row, ri) => (
+                            <tr
+                              key={ri}
+                              onClick={() => openEditPO(row)}
+                              className="border-b border-border cursor-pointer transition-colors hover:bg-hover"
+                            >
+                              {poColumns.map((col) => (
+                                <td
+                                  key={col.key}
+                                  className={`px-4 py-2.5 ${col.align === 'right' ? 'font-mono' : ''}`}
+                                  style={{ textAlign: col.align ?? 'left' }}
+                                >
+                                  {col.render ? col.render(row) : String((row as Record<string, unknown>)[col.key] ?? '—')}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                          {group.pos.length === 0 && (
+                            <tr><td colSpan={poColumns.length} className="px-4 py-8 text-center text-muted">No POs in this group</td></tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Group summary footer */}
+                    {!isStandalone && group.pos.length > 0 && (
+                      <div className="px-4 py-2.5 bg-surface/30 border-t border-border flex items-center justify-between gap-4 text-[13px]">
+                        <div className="flex items-center gap-4">
+                          <span className="text-muted">Procurement: <span className="font-medium text-text">{group.receivedCount}/{group.pos.length} POs received</span></span>
+                          <CostGuard>
+                            <span className="text-muted">
+                              Outstanding: <span className="font-mono font-medium text-text">{fmt$(group.totalValue - group.receivedValue)}</span>
+                            </span>
+                          </CostGuard>
+                        </div>
+                        {/* Progress bar */}
+                        <div className="flex items-center gap-2 min-w-[160px]">
+                          <div className="flex-1 h-1 rounded-full bg-border overflow-hidden">
+                            <div
+                              className="h-full rounded-full transition-all duration-300"
+                              style={{ width: `${pctReceived}%`, background: 'var(--color-brand)' }}
+                            />
+                          </div>
+                          <span className="text-[12px] font-mono text-muted">{Math.round(pctReceived)}%</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
 
       {/* ── SECTION 2: Supplier Directory ── */}
       <div className="mt-12">
@@ -2750,6 +3347,13 @@ When done, save as CSV and send back for import.
                     <span className="flex items-center gap-1.5 text-muted">
                       <CreditCard size={14} />
                       {sup.payment_terms}
+                    </span>
+                  )}
+                  {(sup as any).default_payment_method && (
+                    <span className="flex items-center gap-1.5 text-muted">
+                      <CreditCard size={14} />
+                      {PAYMENT_TERMS_OPTIONS.find((m) => m.value === (sup as any).default_payment_method)?.label ?? (sup as any).default_payment_method}
+                      {(sup as any).default_card_used && <span className="text-[12px] text-muted/70">({(sup as any).default_card_used})</span>}
                     </span>
                   )}
                   {sup.rating != null && (
@@ -2905,6 +3509,60 @@ When done, save as CSV and send back for import.
               </select>
             </label>
           </div>
+
+          {/* Row 4: Payment Method */}
+          <div className="grid grid-cols-3 gap-3">
+            <label className="block">
+              <span className="mb-1 block text-[13px] font-medium text-muted">Payment Method</span>
+              <select value={poPaymentMethod} onChange={(e) => {
+                const val = e.target.value
+                setPOPaymentMethod(val)
+                if (NET_TERM_VALUES.includes(val) && poOrderDate) {
+                  const days: Record<string, number> = { net_15: 15, net_20: 20, net_30: 30, net_45: 45, net_60: 60, net_90: 90 }
+                  const d = new Date(poOrderDate + 'T00:00:00')
+                  if (days[val]) { d.setDate(d.getDate() + days[val]); setPOPaymentDueDate(d.toISOString().split('T')[0]) }
+                }
+              }} className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-[14px] text-text outline-none focus:border-accent">
+                <option value="">Not specified</option>
+                {PAYMENT_TERMS_OPTIONS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+              </select>
+              {poPaymentMethod && poSupplier && (suppliers.find((s) => s.id === poSupplier) as any)?.default_payment_method === poPaymentMethod && (
+                <p className="mt-1 text-[11px] text-muted/70">Auto-filled from supplier default</p>
+              )}
+              {poPaymentMethod === 'melio' && (
+                <div style={{ marginTop: 8, padding: 10, background: 'var(--bg-secondary)', borderRadius: 6, border: '1px solid var(--border-primary)' }}>
+                  <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>Melio Processing Fee (2.9%):</div>
+                  <div style={{ fontSize: 16, fontWeight: 600, color: '#E91E7B', fontFamily: 'monospace' }}>+${((poTotal || 0) * MELIO_FEE_PCT).toFixed(2)}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>PO Subtotal: ${(poTotal || 0).toFixed(2)} → Total with fee: ${((poTotal || 0) * (1 + MELIO_FEE_PCT)).toFixed(2)}</div>
+                </div>
+              )}
+            </label>
+            {(poPaymentMethod === 'credit_card' || poPaymentMethod === 'melio') && (
+              <CardUsedPicker value={poCardUsed} onChange={setPOCardUsed} />
+            )}
+          </div>
+
+          {/* ── Due Date row (only when Net Terms selected) ── */}
+          {NET_TERM_VALUES.includes(poPaymentMethod) && (
+            <div className="grid grid-cols-3 gap-3">
+              <label className="block">
+                <span className="mb-1 block text-[13px] font-medium text-muted">Due Date</span>
+                <input
+                  type="date"
+                  value={poPaymentDueDate}
+                  onChange={(e) => setPOPaymentDueDate(e.target.value)}
+                  className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-[14px] text-text outline-none focus:border-accent"
+                />
+              </label>
+              <div className="flex items-end pb-0.5">
+                {poPaymentDueDate && (
+                  <span className="text-[13px] text-muted">
+                    {PAYMENT_TERMS_OPTIONS.find((t) => t.value === poPaymentMethod)?.label} — Due: <span className="text-text">{new Date(poPaymentDueDate + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Line Items */}
           <div className="border-t border-border pt-4">
@@ -3145,12 +3803,15 @@ When done, save as CSV and send back for import.
               )
             })()}
             <div className="mt-2 flex justify-end">
-              <div className="w-[250px] space-y-1 text-[15px] text-right">
-                {poShippingCost && Number(poShippingCost) > 0 && (
-                  <>
-                    <p className="text-muted">Shipping: <CostGuard><span className="font-mono text-text">{fmt$(Number(poShippingCost))}</span></CostGuard></p>
-                    <p className="text-base text-muted font-bold">Grand Total: <CostGuard><span className="font-mono font-bold text-text">{fmt$(poTotal + Number(poShippingCost))}</span></CostGuard></p>
-                  </>
+              <div className="w-[280px] space-y-1 text-[15px] text-right">
+                {Number(poShippingCost) > 0 && (
+                  <p className="text-muted">Shipping: <CostGuard><span className="font-mono text-text">{fmt$(Number(poShippingCost))}</span></CostGuard></p>
+                )}
+                {poPaymentMethod === 'melio' && (
+                  <p className="text-muted">Melio Fee (2.9%): <CostGuard><span className="font-mono text-text" style={{ color: '#E91E7B' }}>+{fmt$((poTotal || 0) * MELIO_FEE_PCT)}</span></CostGuard></p>
+                )}
+                {(Number(poShippingCost) > 0 || poPaymentMethod === 'melio') && (
+                  <p className="text-base text-muted font-bold">Grand Total: <CostGuard><span className="font-mono font-bold text-text">{fmt$(poTotal + Number(poShippingCost) + (poPaymentMethod === 'melio' ? (poTotal || 0) * MELIO_FEE_PCT : 0))}</span></CostGuard></p>
                 )}
               </div>
             </div>
@@ -3325,6 +3986,24 @@ When done, save as CSV and send back for import.
                 className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-[14px] text-text outline-none focus:border-accent resize-none"
               />
             </label>
+
+            {/* Default Payment Method */}
+            <div className="grid grid-cols-3 gap-4">
+              <label className="block">
+                <span className="mb-1 block text-[13px] font-medium text-muted">Default Payment Method</span>
+                <select
+                  value={editForm.default_payment_method}
+                  onChange={(e) => setEditForm({ ...editForm, default_payment_method: e.target.value, default_card_used: '' })}
+                  className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-[14px] text-text outline-none focus:border-accent"
+                >
+                  <option value="">Not specified</option>
+                  {PAYMENT_TERMS_OPTIONS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+                </select>
+              </label>
+              {(editForm.default_payment_method === 'credit_card' || editForm.default_payment_method === 'melio') && (
+                <CardUsedPicker value={editForm.default_card_used} onChange={(v) => setEditForm({ ...editForm, default_card_used: v })} />
+              )}
+            </div>
 
             {/* Contacts section */}
             <div className="border-t border-border pt-4">
@@ -3776,7 +4455,7 @@ When done, save as CSV and send back for import.
               </label>
             </div>
 
-            {/* Row 3: Destination CP | Tracking | Production Order */}
+            {/* Row 3: Destination CP | Production Order | Notes */}
             <div className="grid grid-cols-3 gap-3">
               <label className="block">
                 <span className="mb-1 block text-[13px] font-medium text-muted">Destination Co-Packer</span>
@@ -3784,10 +4463,6 @@ When done, save as CSV and send back for import.
                   <option value="">Select co-packer...</option>
                   {coPackers.map((cp) => <option key={cp.id} value={cp.id}>{cp.name} ({cp.short_code})</option>)}
                 </select>
-              </label>
-              <label className="block">
-                <span className="mb-1 block text-[13px] font-medium text-muted">Tracking Number</span>
-                <input value={editPOForm.tracking_number} onChange={(e) => setEditPOForm({ ...editPOForm, tracking_number: e.target.value })} placeholder="Optional" className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-[14px] text-text placeholder:text-muted/50 outline-none focus:border-accent" />
               </label>
               <label className="block">
                 <span className="mb-1 block text-[13px] font-medium text-muted">Production Order</span>
@@ -3799,28 +4474,53 @@ When done, save as CSV and send back for import.
                   })}
                 </select>
               </label>
-            </div>
-
-            {/* Row 4: Payment Method | Payment Status | Notes */}
-            <div className="grid grid-cols-3 gap-3">
-              <label className="block">
-                <span className="mb-1 block text-[13px] font-medium text-muted">Payment Method</span>
-                <select value={editPOForm.payment_method} onChange={(e) => setEditPOForm({ ...editPOForm, payment_method: e.target.value })} className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-[14px] text-text outline-none focus:border-accent">
-                  <option value="">Not specified</option>
-                  {PAYMENT_METHODS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
-                </select>
-              </label>
-              <label className="block">
-                <span className="mb-1 block text-[13px] font-medium text-muted">Payment Status</span>
-                <select value={editPOForm.payment_status} onChange={(e) => setEditPOForm({ ...editPOForm, payment_status: e.target.value })} className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-[14px] text-text outline-none focus:border-accent">
-                  {PAYMENT_STATUSES.map((s) => <option key={s.value} value={s.value}>{s.label}</option>)}
-                </select>
-              </label>
               <label className="block">
                 <span className="mb-1 block text-[13px] font-medium text-muted">Notes</span>
                 <input value={editPOForm.notes} onChange={(e) => setEditPOForm({ ...editPOForm, notes: e.target.value })} placeholder="Optional" className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-[14px] text-text placeholder:text-muted/50 outline-none focus:border-accent" />
               </label>
             </div>
+
+            {/* Row 4: Payment Method */}
+            <div className="grid grid-cols-3 gap-3">
+              <label className="block">
+                <span className="mb-1 block text-[13px] font-medium text-muted">Payment Method</span>
+                <select value={editPOForm.payment_method} onChange={(e) => setEditPOForm({ ...editPOForm, payment_method: e.target.value })} className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-[14px] text-text outline-none focus:border-accent">
+                  <option value="">Not specified</option>
+                  {PAYMENT_TERMS_OPTIONS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+                </select>
+                {editPOForm.payment_method === 'melio' && (
+                  <div style={{ marginTop: 8, padding: 10, background: 'var(--bg-secondary)', borderRadius: 6, border: '1px solid var(--border-primary)' }}>
+                    <div style={{ fontSize: 13, color: 'var(--text-secondary)' }}>Melio Processing Fee (2.9%):</div>
+                    <div style={{ fontSize: 16, fontWeight: 600, color: '#E91E7B', fontFamily: 'monospace' }}>+${((editPOTotal || 0) * MELIO_FEE_PCT).toFixed(2)}</div>
+                    <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>PO Subtotal: ${(editPOTotal || 0).toFixed(2)} → Total with fee: ${((editPOTotal || 0) * (1 + MELIO_FEE_PCT)).toFixed(2)}</div>
+                  </div>
+                )}
+              </label>
+              {(editPOForm.payment_method === 'credit_card' || editPOForm.payment_method === 'melio') && (
+                <CardUsedPicker value={editPOForm.card_used} onChange={(v) => setEditPOForm({ ...editPOForm, card_used: v })} />
+              )}
+            </div>
+
+            {/* ── Payment Tracking (only when Net Terms selected) ── */}
+            {NET_TERM_VALUES.includes(editPOForm.payment_method) && (
+              <POPaymentSection
+                purchaseOrderId={editPO.id}
+                totalCost={editPOTotal}
+                shippingCost={editPOForm.shipping_cost ? Number(editPOForm.shipping_cost) : 0}
+                orderDate={editPOForm.order_date || null}
+                paymentTerms={editPOForm.payment_method}
+                paymentDueDate={editPOForm.payment_due_date}
+                onPaymentStatusChange={(status, amountPaid, terms, dueDate) => {
+                  setEditPOForm((prev) => ({
+                    ...prev,
+                    payment_status: status,
+                    amount_paid: amountPaid,
+                    payment_terms: terms,
+                    payment_due_date: dueDate,
+                  }))
+                }}
+              />
+            )}
 
             {/* Line Items */}
             <div className="border-t border-border pt-4">
@@ -4074,6 +4774,15 @@ When done, save as CSV and send back for import.
                   />
                 </label>
               </div>
+              <label className="mt-3 block">
+                <span className="mb-1 block text-[13px] font-medium text-muted">Tracking #</span>
+                <input
+                  value={editPOForm.tracking_number}
+                  onChange={(e) => setEditPOForm({ ...editPOForm, tracking_number: e.target.value })}
+                  placeholder="Optional"
+                  className="w-full rounded-lg border border-border bg-surface px-2 py-1.5 text-[14px] font-mono text-text placeholder:text-muted/50 outline-none focus:border-accent"
+                />
+              </label>
               {editPOForm.shipping_cost && Number(editPOForm.shipping_cost) > 0 && (
                 <p className="mt-2 text-[14px] text-muted">
                   <CostGuard>{(() => {
@@ -4122,12 +4831,15 @@ When done, save as CSV and send back for import.
                 )
               })()}
               <div className="mt-2 flex justify-end">
-                <div className="w-[250px] space-y-1 text-[15px] text-right">
-                  {editPOForm.shipping_cost && Number(editPOForm.shipping_cost) > 0 && (
-                    <>
-                      <p className="text-muted">Shipping: <CostGuard><span className="font-mono text-text">{fmt$(Number(editPOForm.shipping_cost))}</span></CostGuard></p>
-                      <p className="text-base text-muted font-bold">Grand Total: <CostGuard><span className="font-mono font-bold text-text">{fmt$(editPOTotal + Number(editPOForm.shipping_cost))}</span></CostGuard></p>
-                    </>
+                <div className="w-[280px] space-y-1 text-[15px] text-right">
+                  {Number(editPOForm.shipping_cost) > 0 && (
+                    <p className="text-muted">Shipping: <CostGuard><span className="font-mono text-text">{fmt$(Number(editPOForm.shipping_cost))}</span></CostGuard></p>
+                  )}
+                  {editPOForm.payment_method === 'melio' && (
+                    <p className="text-muted">Melio Fee (2.9%): <CostGuard><span className="font-mono text-text" style={{ color: '#E91E7B' }}>+{fmt$((editPOTotal || 0) * MELIO_FEE_PCT)}</span></CostGuard></p>
+                  )}
+                  {(Number(editPOForm.shipping_cost) > 0 || editPOForm.payment_method === 'melio') && (
+                    <p className="text-base text-muted font-bold">Grand Total: <CostGuard><span className="font-mono font-bold text-text">{fmt$(editPOTotal + Number(editPOForm.shipping_cost) + (editPOForm.payment_method === 'melio' ? (editPOTotal || 0) * MELIO_FEE_PCT : 0))}</span></CostGuard></p>
                   )}
                 </div>
               </div>
@@ -4445,6 +5157,54 @@ When done, save as CSV and send back for import.
           </Modal>
         )
       })()}
+
+      {/* ── Backfill Confirm Dialog ── */}
+      <ConfirmDialog
+        isOpen={backfillConfirmOpen && !backfilling && backfillLog.length === 0}
+        title="Backfill Inventory from Received POs"
+        message="This will add inventory from all received POs that haven't been processed yet. Existing inventory won't be changed — only unprocessed POs will be added. Continue?"
+        confirmLabel="Run Backfill"
+        onConfirm={() => { setBackfillConfirmOpen(false); backfillInventory() }}
+        onCancel={() => setBackfillConfirmOpen(false)}
+      />
+
+      {/* ── Backfill Progress Modal ── */}
+      <Modal
+        isOpen={backfilling || backfillLog.length > 0}
+        onClose={() => { if (!backfilling) setBackfillLog([]) }}
+        title="Backfill Inventory"
+      >
+        <div className="space-y-3">
+          {backfilling && (
+            <div className="flex items-center gap-2 text-[14px] text-accent">
+              <span className="animate-spin inline-block w-4 h-4 border-2 border-accent border-t-transparent rounded-full" />
+              Processing received POs...
+            </div>
+          )}
+          <div
+            className="max-h-[400px] overflow-y-auto rounded-lg border border-border bg-surface p-3 font-mono text-[12px] leading-relaxed text-muted"
+            ref={(el) => { if (el) el.scrollTop = el.scrollHeight }}
+          >
+            {backfillLog.length === 0 ? (
+              <span className="text-muted/50">Waiting...</span>
+            ) : (
+              backfillLog.map((line, i) => (
+                <div key={i} className={line.startsWith('═') ? 'font-bold text-text mt-2' : ''}>{line}</div>
+              ))
+            )}
+          </div>
+          {!backfilling && backfillLog.length > 0 && (
+            <div className="flex justify-end">
+              <button
+                onClick={() => setBackfillLog([])}
+                className="rounded-lg bg-accent px-4 py-2 text-[14px] font-medium text-white hover:bg-accent-hover"
+              >
+                Done
+              </button>
+            </div>
+          )}
+        </div>
+      </Modal>
     </div>
   )
 }
@@ -4515,6 +5275,7 @@ function StatusDropdown({
           </div>
         </>
       )}
+
     </div>
   )
 }

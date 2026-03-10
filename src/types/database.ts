@@ -30,6 +30,85 @@ export type FulfillmentCenter    = Tables['fulfillment_centers']['Row']
 export type IngredientTag        = Tables['ingredient_tags']['Row']
 export type IngredientTagLink    = Tables['ingredient_tag_links']['Row']
 
+// ── Production Run Invoice & Payment types (manual until types regen) ──
+export interface ProductionRunInvoice {
+  id: string
+  production_run_id: string | null
+  production_order_id: string | null
+  co_packer_id: string | null
+  invoice_number: string | null
+  invoice_date: string | null
+  total_amount: number
+  per_unit_cost: number | null
+  notes: string | null
+  status: string
+  created_at: string
+}
+
+export interface ProductionRunInvoiceInsert {
+  id?: string
+  production_run_id?: string | null
+  production_order_id?: string | null
+  co_packer_id?: string | null
+  invoice_number?: string | null
+  invoice_date?: string | null
+  total_amount: number
+  per_unit_cost?: number | null
+  notes?: string | null
+  status?: string
+}
+
+export interface ProductionRunPayment {
+  id: string
+  invoice_id: string | null
+  payment_type: string
+  amount: number
+  payment_date: string | null
+  payment_method: string | null
+  reference_number: string | null
+  notes: string | null
+  created_at: string
+}
+
+export interface ProductionRunPaymentInsert {
+  id?: string
+  invoice_id?: string | null
+  payment_type: string
+  amount: number
+  payment_date?: string | null
+  payment_method?: string | null
+  reference_number?: string | null
+  notes?: string | null
+}
+
+// ── PO Payment types (manual until types regen) ──
+export interface POPayment {
+  id: string
+  purchase_order_id: string
+  payment_type: string
+  amount: number
+  payment_date: string | null
+  due_date: string | null
+  payment_method: string | null
+  reference_number: string | null
+  notes: string | null
+  status: string
+  created_at: string
+}
+
+export interface POPaymentInsert {
+  id?: string
+  purchase_order_id: string
+  payment_type: string
+  amount: number
+  payment_date?: string | null
+  due_date?: string | null
+  payment_method?: string | null
+  reference_number?: string | null
+  notes?: string | null
+  status?: string
+}
+
 // ── Insert types (what you pass to an INSERT) ────────────────
 export type CoPackerInsert              = Tables['co_packers']['Insert']
 export type CoPackerContactInsert       = Tables['co_packer_contacts']['Insert']

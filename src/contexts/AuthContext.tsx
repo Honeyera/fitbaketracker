@@ -21,6 +21,8 @@ interface AuthCtx {
   role: AppUserRole | null
   loading: boolean
   needsSetup: boolean
+  passwordRecovery: boolean
+  clearPasswordRecovery: () => void
   can: (permission: Permission) => boolean
   signIn: (email: string, password: string) => Promise<string | null>
   signOut: () => Promise<void>
@@ -33,6 +35,8 @@ const Ctx = createContext<AuthCtx>({
   role: null,
   loading: true,
   needsSetup: false,
+  passwordRecovery: false,
+  clearPasswordRecovery: () => {},
   can: () => false,
   signIn: async () => null,
   signOut: async () => {},
@@ -49,6 +53,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true)
   const [needsSetup, setNeedsSetup] = useState(false)
   const [authReady, setAuthReady] = useState(false)
+  const [passwordRecovery, setPasswordRecovery] = useState(false)
+
+  const clearPasswordRecovery = useCallback(() => setPasswordRecovery(false), [])
 
   const role = appUser?.role ?? null
 
@@ -114,11 +121,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // We intentionally do NOT call getSession() — that caused a race
     // condition with duplicate parallel appUser fetches.
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, s) => {
+      (event, s) => {
         // Only touch React state here — no async Supabase calls.
         // The Supabase client's internal token may not be updated yet
         // when this callback fires, so DB queries here can use a stale
         // token and silently fail.
+        if (event === 'PASSWORD_RECOVERY') {
+          setPasswordRecovery(true)
+        }
         setSession(s)
         setAuthReady((prev) => {
           if (!prev) clearTimeout(deadline)
@@ -182,7 +192,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <Ctx.Provider
-      value={{ session, appUser, role, loading, needsSetup, can, signIn, signOut, refreshAppUser }}
+      value={{ session, appUser, role, loading, needsSetup, passwordRecovery, clearPasswordRecovery, can, signIn, signOut, refreshAppUser }}
     >
       {children}
     </Ctx.Provider>

@@ -17,6 +17,7 @@ import ConfirmDialog from '../components/ConfirmDialog'
 import MRPPanel from '../components/MRPPanel'
 import MRPCreatePOModal from '../components/MRPCreatePOModal'
 import ProcurementTable, { type ProcurementSelection } from '../components/ProcurementTable'
+import StatusDropdown, { type StatusOption } from '../components/StatusDropdown'
 import { PageSkeleton } from '../components/Skeleton'
 import RecipeIcon from '../components/RecipeIcon'
 import { useToast } from '../components/Toast'
@@ -25,9 +26,12 @@ import { logActivity } from '../lib/activityLog'
 import { Plus, Trash2, Download, ChevronDown, ChevronRight, FileDown, Printer, Pencil } from 'lucide-react'
 import { buildMRPRows, buildMRPSummary, nextRunNumber as calcNextRunNumber, type MRPRow } from '../lib/mrp'
 import { syncIngredientStatus } from '../lib/syncIngredientStatus'
+import { syncAfterPOStatusChange } from '../lib/poStatusChange'
 import { buildProcurementRows, buildProcurementSummary, procurementDots, type ProcurementRow } from '../lib/procurement'
 import { generateProductionOrderPDF, type ProductionOrderPDFData } from '../lib/generateProductionOrderPDF'
 import { generatePO_PDF, type POPDFData } from '../lib/generatePO_PDF'
+import InvoicePaymentSection, { getOrderPaymentSummary } from '../components/InvoicePaymentSection'
+import OrderPaymentPopover, { buildLinkedPOs, buildCPInvoiceSummaries, getOrderPOPaymentSummary } from '../components/OrderPaymentPopover'
 import type {
   ProductionRun,
   ProductionOrder,
@@ -46,6 +50,8 @@ import type {
   Supplier,
   ShipmentToCopacker,
   ShipmentItem,
+  ProductionRunInvoice,
+  ProductionRunPayment,
 } from '../types/database'
 import { loadConversions, type ConversionMap } from '../lib/conversions'
 import { calculateRecipeCOGS } from '../lib/recipeCosting'
@@ -102,28 +108,76 @@ const STATUS_DOT_COLOR: Record<string, string> = {
 
 const ORDER_STATUS_BADGE: Record<string, BadgeColor> = {
   draft: 'gray',
-  sent: 'accent',
+  sent_to_cp: 'accent',
+  confirmed_by_cp: 'purple',
   in_production: 'amber',
-  complete: 'green',
+  completed: 'green',
+  shipped: 'cyan',
+  on_hold: 'red',
   cancelled: 'red',
 }
 
 const ORDER_STATUS_LABEL: Record<string, string> = {
   draft: 'Draft',
-  sent: 'Sent',
+  sent_to_cp: 'Sent to CP',
+  confirmed_by_cp: 'Confirmed by CP',
   in_production: 'In Production',
-  complete: 'Complete',
+  completed: 'Completed',
+  shipped: 'Shipped',
+  on_hold: 'On Hold',
   cancelled: 'Cancelled',
+  // Legacy compat
+  sent: 'Sent',
+  complete: 'Complete',
 }
 
-const ORDER_MANUAL_STATUSES = ['draft', 'sent', 'in_production', 'complete', 'cancelled'] as const
+const ORDER_MANUAL_STATUSES = ['draft', 'sent_to_cp', 'confirmed_by_cp', 'in_production', 'completed', 'shipped', 'on_hold', 'cancelled'] as const
+
+/** Which statuses can transition TO which other statuses (order level) */
+const ORDER_TRANSITIONS: Record<string, string[]> = {
+  draft: ['sent_to_cp', 'cancelled'],
+  sent_to_cp: ['confirmed_by_cp', 'on_hold', 'cancelled'],
+  confirmed_by_cp: ['in_production', 'on_hold', 'cancelled'],
+  in_production: ['completed', 'on_hold', 'cancelled'],
+  completed: ['shipped'],
+  shipped: [],
+  on_hold: ['sent_to_cp', 'confirmed_by_cp', 'in_production', 'cancelled'],
+  cancelled: ['draft'],
+  // Legacy compat
+  sent: ['in_production', 'cancelled'],
+  complete: [],
+}
+
+/** Transitions that require a confirmation dialog (order level) */
+const ORDER_CONFIRM_MESSAGES: Record<string, { title: string; message: string; danger: boolean }> = {
+  in_production: { title: 'Start Production?', message: 'Also update pending/scheduled runs to In Production?', danger: false },
+  completed: { title: 'Mark as Completed?', message: 'Make sure all production runs are finished.', danger: false },
+  on_hold: { title: 'Put On Hold?', message: 'This will pause the production order.', danger: false },
+  cancelled: { title: 'Cancel this order?', message: 'This will cancel the order and flag linked runs.', danger: true },
+}
+
+/** Which statuses can transition for runs */
+const RUN_TRANSITIONS: Record<string, string[]> = {
+  requested: ['scheduled', 'in_production'],
+  scheduled: ['in_production', 'requested'],
+  in_production: ['complete', 'flagged'],
+  complete: [],
+  reconciled: [],
+  flagged: ['in_production'],
+}
 
 const ORDER_STATUS_DOT: Record<string, string> = {
-  draft: '#7A8599',
-  sent: '#3B82F6',
+  draft: '#6B7280',
+  sent_to_cp: '#3B82F6',
+  confirmed_by_cp: '#8B5CF6',
   in_production: '#F59E0B',
+  completed: '#10B981',
+  shipped: '#06B6D4',
+  on_hold: '#EF4444',
+  cancelled: '#991B1B',
+  // Legacy compat
+  sent: '#3B82F6',
   complete: '#22C55E',
-  cancelled: '#EF4444',
 }
 
 /* ── Procurement badge/row configs (now in ProcurementTable) ── */
@@ -172,6 +226,8 @@ export default function ProductionRuns() {
   const [supplierContacts, setSupplierContacts] = useState<SupplierContact[]>([])
   const [shipments, setShipments] = useState<ShipmentToCopacker[]>([])
   const [shipmentItems, setShipmentItems] = useState<ShipmentItem[]>([])
+  const [cpInvoices, setCpInvoices] = useState<ProductionRunInvoice[]>([])
+  const [cpPayments, setCpPayments] = useState<ProductionRunPayment[]>([])
 
   /* ── UI state ───────────────────────────────────────────────── */
   const [saving, setSaving] = useState(false)
@@ -188,9 +244,6 @@ export default function ProductionRuns() {
   /* ── Complete run modal ─────────────────────────────────────── */
   const [completeRunId, setCompleteRunId] = useState<string | null>(null)
   const [producedQty, setProducedQty] = useState('')
-
-  /* ── Status dropdown (runs) ─────────────────────────────────── */
-  const [openDropdown, setOpenDropdown] = useState<string | null>(null)
 
   /* ── Edit run modal ─────────────────────────────────────────── */
   const [editRun, setEditRun] = useState<ProductionRun | null>(null)
@@ -219,8 +272,10 @@ export default function ProductionRuns() {
   /* ── Expanded order cards ───────────────────────────────────── */
   const [expandedOrders, setExpandedOrders] = useState<Set<string>>(new Set())
 
-  /* ── Order status dropdown ──────────────────────────────────── */
-  const [orderDropdown, setOrderDropdown] = useState<string | null>(null)
+  /* ── Order status confirmation ────────────────────────────── */
+  const [orderStatusConfirm, setOrderStatusConfirm] = useState<{
+    orderId: string; newStatus: string; cascade: boolean
+  } | null>(null)
 
   /* ── Complete order modal (enter produced qty per run) ───────── */
   const [completeOrderId, setCompleteOrderId] = useState<string | null>(null)
@@ -295,6 +350,18 @@ export default function ProductionRuns() {
       setShipmentItems(shipItemRes.data ?? [])
     } catch (err) {
       console.error('Failed to load supplementary data:', err)
+    }
+
+    // Phase 3: Invoice & payment data (isolated so failures don't break procurement)
+    try {
+      const [cpInvRes, cpPayRes] = await safeBatch(() => Promise.all([
+        supabase.from('production_run_invoices').select('*'),
+        supabase.from('production_run_payments').select('*'),
+      ]))
+      setCpInvoices(cpInvRes.data ?? [])
+      setCpPayments(cpPayRes.data ?? [])
+    } catch (err) {
+      console.error('Failed to load invoice data:', err)
     }
   }
 
@@ -406,10 +473,28 @@ export default function ProductionRuns() {
         label: 'Status',
         key: 'status',
         align: 'center',
-        width: '120px',
+        width: '150px',
         render: (row) => {
           const s = row.status as string
-          return <Badge color={RUN_STATUS_BADGE[s] ?? 'gray'}>{RUN_STATUS_LABEL[s] ?? s.toUpperCase()}</Badge>
+          const transitions = RUN_TRANSITIONS[s] ?? []
+          if (transitions.length === 0) {
+            return <Badge color={RUN_STATUS_BADGE[s] ?? 'gray'}>{RUN_STATUS_LABEL[s] ?? s.toUpperCase()}</Badge>
+          }
+          const opts: StatusOption[] = transitions.map((st) => ({
+            value: st,
+            label: RUN_STATUS_LABEL[st] ?? st,
+            dotColor: STATUS_DOT_COLOR[st] ?? '#7A8599',
+          }))
+          return (
+            <div onClick={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()}>
+              <StatusDropdown
+                trigger={<Badge color={RUN_STATUS_BADGE[s] ?? 'gray'}>{RUN_STATUS_LABEL[s] ?? s.toUpperCase()} ▾</Badge>}
+                options={opts}
+                onSelect={(st) => handleRunStatusChange(row.id as string, s, st)}
+                align="right"
+              />
+            </div>
+          )
         },
       },
       {
@@ -418,51 +503,13 @@ export default function ProductionRuns() {
         width: '100px',
         render: (row) => <span className="text-[13px] text-muted">{row.requested_date ? fmtDate(row.requested_date as string) : '—'}</span>,
       },
-      {
-        label: '',
-        key: '_action',
-        width: '120px',
-        align: 'center',
-        render: (row) => {
-          const s = row.status as string
-          const options = MANUAL_STATUSES.filter((st) => st !== s)
-          return (
-            <div className="relative" onClick={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()}>
-              <button
-                onClick={() => setOpenDropdown(openDropdown === row.id ? null : (row.id as string))}
-                className="rounded px-2 py-0.5 text-[13px] font-medium text-accent transition-colors hover:bg-accent/10"
-              >
-                Status ▾
-              </button>
-              {openDropdown === row.id && (
-                <>
-                  <div className="fixed inset-0 z-40" onClick={() => setOpenDropdown(null)} />
-                  <div className="absolute right-0 top-full z-50 mt-1 min-w-[160px] rounded-lg border border-border bg-card py-1 shadow-xl">
-                    {options.map((st) => (
-                      <button
-                        key={st}
-                        onClick={(e) => { e.stopPropagation(); handleRunStatusChange(row.id as string, s, st) }}
-                        className="flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] text-text transition-colors hover:bg-hover"
-                      >
-                        <div className="h-2 w-2 rounded-full" style={{ backgroundColor: STATUS_DOT_COLOR[st] ?? '#7A8599' }} />
-                        {RUN_STATUS_LABEL[st]}
-                      </button>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
-          )
-        },
-      },
     ],
-    [openDropdown, recipes, coPackers],
+    [recipes, coPackers],
   )
 
   /* ── Run status change ──────────────────────────────────────── */
 
   async function handleRunStatusChange(runId: string, currentStatus: string, newStatus: string) {
-    setOpenDropdown(null)
 
     if (newStatus === 'complete') {
       const run = runs.find((r) => r.id === runId)
@@ -475,9 +522,9 @@ export default function ProductionRuns() {
 
     setSaving(true)
     try {
+      const run = runs.find((r) => r.id === runId)
       const updates: Record<string, unknown> = { status: newStatus }
       if (newStatus === 'in_production' && currentStatus !== 'in_production') {
-        const run = runs.find((r) => r.id === runId)
         if (!run?.started_date) updates.started_date = format(new Date(), 'yyyy-MM-dd')
       }
       if (currentStatus === 'complete' && newStatus !== 'complete') {
@@ -487,7 +534,33 @@ export default function ProductionRuns() {
       }
 
       const { error } = await dbUpdate('production_runs', sanitize('production_runs', updates), 'id', runId)
-      if (error) toast.error(error.message)
+      if (error) { toast.error(error.message); return }
+
+      // Auto-promote order to in_production if a run moves there
+      if (newStatus === 'in_production' && run?.production_order_id) {
+        const order = orders.find((o) => o.id === run.production_order_id)
+        if (order && (order.status === 'draft' || order.status === 'sent' || order.status === 'sent_to_cp' || order.status === 'confirmed_by_cp')) {
+          await dbUpdate('production_orders', sanitize('production_orders', {
+            status: 'in_production',
+            updated_at: new Date().toISOString(),
+          }), 'id', order.id)
+          toast.info(`Order ${order.order_number} auto-updated to In Production`)
+        }
+      }
+
+      // Prompt to complete order if all runs now complete
+      if (newStatus === 'complete' && run?.production_order_id) {
+        const order = orders.find((o) => o.id === run.production_order_id)
+        if (order && order.status === 'in_production') {
+          const siblings = runs.filter((r) => r.production_order_id === run.production_order_id && r.id !== runId)
+          const allDone = siblings.every((r) => r.status === 'complete' || r.status === 'reconciled')
+          if (allDone) {
+            toast.info(`All runs complete — you can now mark ${order.order_number} as Completed`)
+          }
+        }
+      }
+
+      toast.success(`Run status updated to ${RUN_STATUS_LABEL[newStatus] ?? newStatus}`)
       load()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to update run status')
@@ -924,41 +997,152 @@ export default function ProductionRuns() {
     closeEditOrder()
   }
 
-  /* ── Order status change ────────────────────────────────────── */
+  /* ── Procurement status change (updates linked POs) ─────────── */
 
-  async function handleOrderStatusChange(orderId: string, newStatus: string) {
-    setOrderDropdown(null)
+  async function handleProcurementStatusChange(ingredientId: string, newStatus: string, linkedPOIds: string[]) {
+    if (linkedPOIds.length === 0) return
 
-    // Changing to complete → prompt for produced quantities
-    if (newStatus === 'complete') {
-      const orderRuns = runs.filter((r) => r.production_order_id === orderId)
-      const needQty = orderRuns.some((r) => r.produced_quantity == null)
-      if (needQty) {
-        setCompleteOrderId(orderId)
-        const qtys: Record<string, string> = {}
-        for (const r of orderRuns) qtys[r.id] = r.produced_quantity != null ? String(r.produced_quantity) : ''
-        setCompleteOrderQtys(qtys)
-        return
-      }
+    // Map procurement status to PO status
+    const PROC_TO_PO: Record<string, string> = {
+      ORDERED: 'ordered',
+      IN_TRANSIT: 'in_transit',
+      RECEIVED: 'received',
+      READY: 'received',
     }
+    const poStatus = PROC_TO_PO[newStatus]
+    if (!poStatus) return
 
     setSaving(true)
     try {
-      await dbUpdate('production_orders', sanitize('production_orders', { status: newStatus }), 'id', orderId)
+      for (const poId of linkedPOIds) {
+        const po = purchaseOrders.find((p) => p.id === poId)
+        // Update PO status
+        await dbUpdate('purchase_orders', sanitize('purchase_orders', {
+          status: poStatus,
+          updated_at: new Date().toISOString(),
+        }), 'id', poId)
+
+        // Full sync chain: shipment + ingredient status (non-blocking)
+        syncAfterPOStatusChange(poId, poStatus, {
+          productionOrderId: po?.production_order_id ?? null,
+        })
+      }
+      const ing = ingredients.find((i) => i.id === ingredientId)
+      toast.success(`${ing?.name ?? 'Ingredient'} → ${newStatus.replace('_', ' ')} (${linkedPOIds.length} PO${linkedPOIds.length !== 1 ? 's' : ''} updated — shipment synced)`)
+
+      load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to update procurement status')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  /* ── ETA change from procurement table ──────────────────────── */
+
+  async function handleETAChange(poId: string, newDate: string | null) {
+    try {
+      await dbUpdate('purchase_orders', sanitize('purchase_orders', {
+        eta_date: newDate,
+        updated_at: new Date().toISOString(),
+      }), 'id', poId)
+      toast.success(`ETA updated${newDate ? ` to ${newDate}` : ' (cleared)'}`)
+      load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to update ETA')
+    }
+  }
+
+  /* ── Order status change ────────────────────────────────────── */
+
+  function handleOrderStatusChange(orderId: string, newStatus: string) {
+
+    // Changing to completed → prompt for produced quantities first
+    if (newStatus === 'completed') {
+      const orderRuns = runs.filter((r) => r.production_order_id === orderId)
+      const incompleteRuns = orderRuns.filter((r) => r.status !== 'complete' && r.status !== 'reconciled')
+      if (incompleteRuns.length > 0) {
+        // Some runs aren't done — show qty prompt
+        const needQty = orderRuns.some((r) => r.produced_quantity == null)
+        if (needQty) {
+          setCompleteOrderId(orderId)
+          const qtys: Record<string, string> = {}
+          for (const r of orderRuns) qtys[r.id] = r.produced_quantity != null ? String(r.produced_quantity) : ''
+          setCompleteOrderQtys(qtys)
+          return
+        }
+      }
+    }
+
+    // Check if this transition needs confirmation
+    if (ORDER_CONFIRM_MESSAGES[newStatus]) {
+      setOrderStatusConfirm({ orderId, newStatus, cascade: true })
+      return
+    }
+
+    // Simple toast transitions (no confirmation needed)
+    if (newStatus === 'sent_to_cp') {
+      executeOrderStatusChange(orderId, newStatus, false)
+      toast.success('Production order sent to co-packer')
+      return
+    }
+    if (newStatus === 'confirmed_by_cp') {
+      executeOrderStatusChange(orderId, newStatus, false)
+      toast.success('Co-packer confirmed the order')
+      return
+    }
+    if (newStatus === 'shipped') {
+      executeOrderStatusChange(orderId, newStatus, false)
+      toast.success('Order marked as shipped')
+      return
+    }
+
+    // No confirmation needed — execute directly
+    executeOrderStatusChange(orderId, newStatus, true)
+  }
+
+  async function executeOrderStatusChange(orderId: string, newStatus: string, cascade: boolean) {
+    setOrderStatusConfirm(null)
+    setSaving(true)
+    try {
+      await dbUpdate('production_orders', sanitize('production_orders', {
+        status: newStatus,
+        updated_at: new Date().toISOString(),
+      }), 'id', orderId)
 
       // Cascade to child runs
-      if (newStatus === 'in_production') {
+      if (cascade) {
         const orderRuns = runs.filter((r) => r.production_order_id === orderId)
-        for (const r of orderRuns) {
-          if (r.status === 'requested' || r.status === 'scheduled') {
-            await dbUpdate('production_runs', sanitize('production_runs', {
-              status: 'in_production',
-              started_date: r.started_date ?? format(new Date(), 'yyyy-MM-dd'),
-            }), 'id', r.id)
+        if (newStatus === 'in_production') {
+          for (const r of orderRuns) {
+            if (r.status === 'requested' || r.status === 'scheduled') {
+              await dbUpdate('production_runs', sanitize('production_runs', {
+                status: 'in_production',
+                started_date: r.started_date ?? format(new Date(), 'yyyy-MM-dd'),
+              }), 'id', r.id)
+            }
+          }
+        } else if (newStatus === 'cancelled') {
+          for (const r of orderRuns) {
+            if (r.status !== 'complete' && r.status !== 'reconciled') {
+              await dbUpdate('production_runs', sanitize('production_runs', {
+                status: 'flagged',
+              }), 'id', r.id)
+            }
+          }
+        } else if (newStatus === 'on_hold') {
+          for (const r of orderRuns) {
+            if (r.status === 'in_production' || r.status === 'scheduled') {
+              await dbUpdate('production_runs', sanitize('production_runs', {
+                status: 'flagged',
+              }), 'id', r.id)
+            }
           }
         }
       }
 
+      toast.success(`Status updated to ${ORDER_STATUS_LABEL[newStatus] ?? newStatus}`)
+      syncIngredientStatus(orderId)
       load()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Failed to update order status')
@@ -984,8 +1168,8 @@ export default function ProductionRuns() {
           waste_pct: wastePct >= 0 ? Math.round(wastePct * 10) / 10 : null,
         }), 'id', r.id)
       }
-      await dbUpdate('production_orders', sanitize('production_orders', { status: 'complete' }), 'id', completeOrderId)
-      toast.success('Order marked as complete')
+      await dbUpdate('production_orders', sanitize('production_orders', { status: 'completed' }), 'id', completeOrderId)
+      toast.success('Order marked as completed')
       logActivity(appUser?.id, 'update_production_order', 'production_order', completeOrderId)
       setCompleteOrderId(null)
       load()
@@ -1167,7 +1351,7 @@ export default function ProductionRuns() {
   }, [editOrder, runs, recipeIngredients, ingredients, inventory, purchaseOrders, poItems, conversions])
 
   const orderProcurementMap = useMemo(() => {
-    const map = new Map<string, { rows: ProcurementRow[]; summary: ReturnType<typeof buildProcurementSummary>; green: number; blue: number; red: number; total: number }>()
+    const map = new Map<string, { rows: ProcurementRow[]; summary: ReturnType<typeof buildProcurementSummary>; dots: ReturnType<typeof procurementDots> }>()
     for (const order of orders) {
       if (!order.co_packer_id) continue
       const orderRuns = runs.filter((r) => r.production_order_id === order.id)
@@ -1184,7 +1368,7 @@ export default function ProductionRuns() {
       })
       const dots = procurementDots(rows)
       const summary = buildProcurementSummary(rows)
-      map.set(order.id, { rows, summary, ...dots, total: rows.length })
+      map.set(order.id, { rows, summary, dots })
     }
     return map
   }, [orders, runs, recipeIngredients, ingredients, inventory, purchaseOrders, poItems, conversions])
@@ -1305,72 +1489,143 @@ export default function ProductionRuns() {
             return (
               <div key={order.id} className="rounded-xl border border-border bg-card overflow-hidden">
                 {/* Card header */}
-                <button
-                  type="button"
+                <div
+                  role="button"
+                  tabIndex={0}
                   onClick={() => toggleOrder(order.id)}
-                  className="flex w-full items-center gap-4 px-5 py-4 text-left transition-colors hover:bg-hover"
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleOrder(order.id) } }}
+                  className="px-5 py-4 transition-colors hover:bg-hover cursor-pointer"
                 >
-                  {expanded ? <ChevronDown size={18} className="text-muted shrink-0" /> : <ChevronRight size={18} className="text-muted shrink-0" />}
-                  <span className="font-mono text-base font-bold text-accent">{order.order_number}</span>
-                  {cp && <CPBadge coPacker={cp} />}
-                  <span className="text-[15px] text-text">{cp?.name ?? '—'}</span>
-                  <span className="text-[14px] text-muted">{orderRuns.length} flavor{orderRuns.length !== 1 ? 's' : ''}</span>
-                  <span className="text-[14px] text-muted font-mono">{totalUnits.toLocaleString()} units</span>
-                  <Badge color={ORDER_STATUS_BADGE[status] ?? 'gray'}>{ORDER_STATUS_LABEL[status] ?? status}</Badge>
-                  {order.order_date && <span className="text-[13px] text-muted">{fmtDate(order.order_date)}</span>}
-                  {order.total_estimated_cost != null && Number(order.total_estimated_cost) > 0 && (
-                    <span className="ml-auto text-[14px] font-mono text-muted">{fmt$(Number(order.total_estimated_cost))}</span>
-                  )}
-                  {(() => {
-                    const dots = orderProcurementMap.get(order.id)
-                    if (!dots || dots.total === 0) return null
-                    return (
-                      <span className="ml-2 flex items-center gap-1">
-                        {Array.from({ length: dots.green }, (_, i) => (
-                          <span key={`g${i}`} className="inline-block h-2.5 w-2.5 rounded-full bg-green-400" />
-                        ))}
-                        {Array.from({ length: dots.blue }, (_, i) => (
-                          <span key={`b${i}`} className="inline-block h-2.5 w-2.5 rounded-full bg-blue-400" />
-                        ))}
-                        {Array.from({ length: dots.red }, (_, i) => (
-                          <span key={`r${i}`} className="inline-block h-2.5 w-2.5 rounded-full bg-red-400" />
-                        ))}
-                        <span className="ml-1 text-[13px] text-muted">{dots.green}/{dots.total}</span>
-                      </span>
-                    )
-                  })()}
-                </button>
+                  {/* Row 1: Order identity + status */}
+                  <div className="flex items-center gap-3">
+                    {expanded ? <ChevronDown size={16} className="text-muted shrink-0" /> : <ChevronRight size={16} className="text-muted shrink-0" />}
+                    <span className="font-mono text-[15px] font-bold text-accent">{order.order_number}</span>
+                    {cp && <CPBadge coPacker={cp} />}
+                    <span className="text-[14px] text-text">{cp?.name ?? '—'}</span>
+                    <span className="ml-auto" />
+                    {/* Clickable status badge */}
+                    {(() => {
+                      const transitions = ORDER_TRANSITIONS[status] ?? []
+                      if (transitions.length === 0) {
+                        return <Badge color={ORDER_STATUS_BADGE[status] ?? 'gray'}>{ORDER_STATUS_LABEL[status] ?? status}</Badge>
+                      }
+                      const opts: StatusOption[] = transitions.map((s) => ({
+                        value: s,
+                        label: ORDER_STATUS_LABEL[s] ?? s,
+                        dotColor: ORDER_STATUS_DOT[s] ?? '#7A8599',
+                      }))
+                      return (
+                        <div onClick={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()}>
+                          <StatusDropdown
+                            trigger={<Badge color={ORDER_STATUS_BADGE[status] ?? 'gray'}>{ORDER_STATUS_LABEL[status] ?? status} ▾</Badge>}
+                            options={opts}
+                            onSelect={(s) => handleOrderStatusChange(order.id, s)}
+                          />
+                        </div>
+                      )
+                    })()}
+                  </div>
+                  {/* Row 2: Details */}
+                  <div className="mt-1.5 ml-7 flex items-center gap-4 text-[13px] text-muted">
+                    <span>{orderRuns.length} flavor{orderRuns.length !== 1 ? 's' : ''}</span>
+                    <span className="font-mono">{totalUnits.toLocaleString()} units</span>
+                    {order.order_date && <span>{fmtDate(order.order_date)}</span>}
+                    {order.total_estimated_cost != null && Number(order.total_estimated_cost) > 0 && (
+                      <span className="font-mono">{fmt$(Number(order.total_estimated_cost))}</span>
+                    )}
+                    {/* Procurement dots */}
+                    {(() => {
+                      const proc = orderProcurementMap.get(order.id)
+                      if (!proc || proc.dots.total === 0) return null
+                      const d = proc.dots
+                      return (
+                        <span className="flex items-center gap-0.5">
+                          {Array.from({ length: d.green }, (_, i) => (
+                            <span key={`g${i}`} className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: '#22C55E' }} />
+                          ))}
+                          {Array.from({ length: d.cyan }, (_, i) => (
+                            <span key={`c${i}`} className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: '#06B6D4' }} />
+                          ))}
+                          {Array.from({ length: d.blue }, (_, i) => (
+                            <span key={`b${i}`} className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: '#3B82F6' }} />
+                          ))}
+                          {Array.from({ length: d.gray }, (_, i) => (
+                            <span key={`d${i}`} className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: '#7A8599' }} />
+                          ))}
+                          {Array.from({ length: d.amber }, (_, i) => (
+                            <span key={`a${i}`} className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: '#F59E0B' }} />
+                          ))}
+                          {Array.from({ length: d.red }, (_, i) => (
+                            <span key={`r${i}`} className="inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: '#EF4444' }} />
+                          ))}
+                          <span className="ml-0.5">{d.green}/{d.total}</span>
+                        </span>
+                      )
+                    })()}
+                    {/* Payment status (POs + CP invoices combined) */}
+                    {(() => {
+                      const poSummary = getOrderPOPaymentSummary(order.id, purchaseOrders)
+                      const cpSummary = getOrderPaymentSummary(order.id, cpInvoices, cpPayments)
+
+                      const hasPOs = poSummary.status !== 'no_pos'
+                      const hasCPInv = cpSummary.status !== 'none'
+                      if (!hasPOs && !hasCPInv) return null
+
+                      const combinedTotal = poSummary.total + cpSummary.cpCost
+                      const combinedPaid = poSummary.paid + cpSummary.totalPaid
+                      const combinedBalance = Math.max(0, combinedTotal - combinedPaid)
+                      const allPaid = combinedPaid >= combinedTotal && combinedTotal > 0
+
+                      let display: React.ReactNode
+                      if (allPaid) {
+                        display = (
+                          <span className="rounded-md px-2 py-0.5 transition-colors hover:bg-hover-strong" style={{ color: '#22C55E' }}>
+                            All paid ✓
+                          </span>
+                        )
+                      } else if (combinedPaid > 0) {
+                        display = (
+                          <span className="font-mono rounded-md px-2 py-0.5 transition-colors hover:bg-hover-strong" style={{ color: '#F59E0B' }}>
+                            {fmt$(combinedPaid)} / {fmt$(combinedTotal)} paid
+                            {hasPOs && ` (${poSummary.poCount} PO${poSummary.poCount !== 1 ? 's' : ''})`}
+                          </span>
+                        )
+                      } else if (poSummary.hasOverdue) {
+                        display = (
+                          <span className="font-mono font-bold rounded-md px-2 py-0.5 transition-colors hover:bg-hover-strong" style={{ color: '#EF4444' }}>
+                            Overdue ⚠ ({fmt$(combinedBalance)} due)
+                          </span>
+                        )
+                      } else {
+                        display = (
+                          <span className="font-mono rounded-md px-2 py-0.5 transition-colors hover:bg-hover-strong" style={{ color: '#EF4444' }}>
+                            Unpaid ({fmt$(combinedTotal)})
+                          </span>
+                        )
+                      }
+
+                      const linkedPOData = buildLinkedPOs(order.id, purchaseOrders, suppliers)
+                      const cpInvData = buildCPInvoiceSummaries(order.id, cpInvoices, cpPayments)
+
+                      return (
+                        <OrderPaymentPopover
+                          orderNumber={order.order_number}
+                          linkedPOs={linkedPOData}
+                          cpInvoices={cpInvData}
+                          onDone={load}
+                        >
+                          {display}
+                        </OrderPaymentPopover>
+                      )
+                    })()}
+                  </div>
+                </div>
 
                 {/* Expanded content */}
                 {expanded && (
                   <div className="border-t border-border px-5 py-4 space-y-4">
                     {/* Actions bar */}
                     <div className="flex items-center gap-2">
-                      <div className="relative" onClick={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()}>
-                        <button
-                          onClick={() => setOrderDropdown(orderDropdown === order.id ? null : order.id)}
-                          className="rounded-lg border border-border px-3 py-1.5 text-[13px] font-medium text-muted transition-colors hover:text-text hover:bg-hover"
-                        >
-                          Change Status ▾
-                        </button>
-                        {orderDropdown === order.id && (
-                          <>
-                            <div className="fixed inset-0 z-40" onClick={() => setOrderDropdown(null)} />
-                            <div className="absolute left-0 top-full z-50 mt-1 w-48 rounded-lg border border-border bg-card py-1 shadow-xl">
-                              {ORDER_MANUAL_STATUSES.filter((s) => s !== status).map((s) => (
-                                <button
-                                  key={s}
-                                  onClick={() => handleOrderStatusChange(order.id, s)}
-                                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] text-text transition-colors hover:bg-hover"
-                                >
-                                  <div className="h-2 w-2 rounded-full" style={{ backgroundColor: ORDER_STATUS_DOT[s] ?? '#7A8599' }} />
-                                  {ORDER_STATUS_LABEL[s]}
-                                </button>
-                              ))}
-                            </div>
-                          </>
-                        )}
-                      </div>
                       <button
                         onClick={() => openEditOrder(order)}
                         className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-[13px] font-medium text-muted transition-colors hover:text-text hover:bg-hover"
@@ -1434,7 +1689,25 @@ export default function ProductionRuns() {
                                   ) : '—'}
                                 </td>
                                 <td className="px-3 py-3 text-center">
-                                  <Badge color={RUN_STATUS_BADGE[rs] ?? 'gray'}>{RUN_STATUS_LABEL[rs] ?? rs}</Badge>
+                                  {(() => {
+                                    const runTransitions = RUN_TRANSITIONS[rs] ?? []
+                                    if (runTransitions.length === 0) {
+                                      return <Badge color={RUN_STATUS_BADGE[rs] ?? 'gray'}>{RUN_STATUS_LABEL[rs] ?? rs}</Badge>
+                                    }
+                                    const opts: StatusOption[] = runTransitions.map((st) => ({
+                                      value: st,
+                                      label: RUN_STATUS_LABEL[st] ?? st,
+                                      dotColor: STATUS_DOT_COLOR[st] ?? '#7A8599',
+                                    }))
+                                    return (
+                                      <StatusDropdown
+                                        trigger={<Badge color={RUN_STATUS_BADGE[rs] ?? 'gray'}>{RUN_STATUS_LABEL[rs] ?? rs} ▾</Badge>}
+                                        options={opts}
+                                        onSelect={(st) => handleRunStatusChange(r.id, rs, st)}
+                                        align="right"
+                                      />
+                                    )
+                                  })()}
                                 </td>
                               </tr>
                             )
@@ -1453,15 +1726,29 @@ export default function ProductionRuns() {
                           procRows={procRows}
                           procSummary={procSummary}
                           order={order}
+                          purchaseOrders={purchaseOrders}
                           suppliers={suppliers}
+                          supplierContacts={supplierContacts}
                           supplierIngredients={supplierIngredients}
                           ingredients={ingredients}
                           conversions={conversions}
                           onOrderRow={(row, sel) => handleOrderIngredientForOrder(order, row, sel)}
                           onOrderAll={(rows, selMap) => handleOrderAllMissingForOrder(order, rows, selMap)}
+                          onStatusChange={handleProcurementStatusChange}
+                          onETAChange={handleETAChange}
                         />
                       )
                     })()}
+
+                    {/* CP Invoice & Payments */}
+                    <InvoicePaymentSection
+                      order={order}
+                      runs={runs}
+                      coPackers={coPackers}
+                      invoices={cpInvoices}
+                      payments={cpPayments}
+                      onRefresh={load}
+                    />
 
                     {/* Linked Purchase Orders */}
                     {(() => {
@@ -1788,14 +2075,28 @@ export default function ProductionRuns() {
                   procRows={editOrderProcurement.rows}
                   procSummary={editOrderProcurement.summary}
                   order={editOrder}
+                  purchaseOrders={purchaseOrders}
                   suppliers={suppliers}
+                  supplierContacts={supplierContacts}
                   supplierIngredients={supplierIngredients}
                   ingredients={ingredients}
                   conversions={conversions}
                   onOrderRow={(row, sel) => handleOrderIngredient(row, sel)}
                   onOrderAll={(rows, selMap) => handleOrderAllMissing(rows, selMap)}
+                  onStatusChange={handleProcurementStatusChange}
+                  onETAChange={handleETAChange}
                 />
               )}
+
+              {/* CP Invoice & Payments (in edit modal) */}
+              <InvoicePaymentSection
+                order={editOrder}
+                runs={runs}
+                coPackers={coPackers}
+                invoices={cpInvoices}
+                payments={cpPayments}
+                onRefresh={load}
+              />
 
               {/* Linked Purchase Orders */}
               {(() => {
@@ -1908,6 +2209,63 @@ export default function ProductionRuns() {
         onConfirm={confirmCPChange}
         onCancel={() => { setCPChangeWarning(false); setPendingCP('') }}
       />
+
+      {/* ── Order Status Confirmation Dialog ───────────────────── */}
+      {orderStatusConfirm && (() => {
+        const cfg = ORDER_CONFIRM_MESSAGES[orderStatusConfirm.newStatus]
+        if (!cfg) return null
+        const orderRuns = runs.filter((r) => r.production_order_id === orderStatusConfirm.orderId)
+        const cascadeRuns = orderStatusConfirm.newStatus === 'in_production'
+          ? orderRuns.filter((r) => r.status === 'requested' || r.status === 'scheduled')
+          : orderStatusConfirm.newStatus === 'cancelled'
+            ? orderRuns.filter((r) => r.status !== 'complete' && r.status !== 'reconciled')
+            : orderStatusConfirm.newStatus === 'on_hold'
+              ? orderRuns.filter((r) => r.status === 'in_production' || r.status === 'scheduled')
+              : []
+        return (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center">
+            <div className="absolute inset-0 bg-overlay" onClick={() => setOrderStatusConfirm(null)} />
+            <div className="relative z-10 w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-2xl">
+              <div className="mb-4 flex items-center gap-3">
+                <div className={`flex h-10 w-10 items-center justify-center rounded-full ${cfg.danger ? 'bg-red-500/15' : 'bg-accent/15'}`}>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={cfg.danger ? 'text-red-400' : 'text-accent'}><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-text">{cfg.title}</h3>
+                  <p className="mt-0.5 text-xs text-muted">{cfg.message}</p>
+                </div>
+              </div>
+              {cascadeRuns.length > 0 && (
+                <label className="mb-4 flex items-center gap-2 rounded-lg bg-surface px-3 py-2 text-xs text-muted cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={orderStatusConfirm.cascade}
+                    onChange={(e) => setOrderStatusConfirm({ ...orderStatusConfirm, cascade: e.target.checked })}
+                    className="accent-accent"
+                  />
+                  Also update {cascadeRuns.length} production run{cascadeRuns.length !== 1 ? 's' : ''} to{' '}
+                  {(orderStatusConfirm.newStatus === 'cancelled' || orderStatusConfirm.newStatus === 'on_hold') ? 'Flagged' : ORDER_STATUS_LABEL[orderStatusConfirm.newStatus] ?? orderStatusConfirm.newStatus}
+                </label>
+              )}
+              <div className="flex justify-end gap-3">
+                <button
+                  onClick={() => setOrderStatusConfirm(null)}
+                  className="rounded-lg border border-border px-4 py-2 text-sm text-muted transition-colors hover:text-text"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => executeOrderStatusChange(orderStatusConfirm.orderId, orderStatusConfirm.newStatus, orderStatusConfirm.cascade)}
+                  disabled={saving}
+                  className={`rounded-lg px-4 py-2 text-sm font-medium text-white transition-colors disabled:opacity-50 ${cfg.danger ? 'bg-red-500 hover:bg-red-600' : 'bg-accent hover:bg-accent-hover'}`}
+                >
+                  {saving ? 'Working…' : 'Confirm'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
 
       {/* ── New Production Order Modal (3-step) ────────────────── */}
       <Modal isOpen={orderModalOpen} onClose={() => { setOrderModalOpen(false); resetOrderForm() }} title={orderStep === 1 ? 'New Production Order — Select Co-Packer' : orderStep === 2 ? 'New Production Order — Add Flavors' : 'New Production Order — Ingredient Requirements'} wide={orderStep >= 2 ? '3xl' : undefined}>

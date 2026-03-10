@@ -7,7 +7,7 @@ import { supabase } from '../lib/supabase'
 import { Sun, Moon } from 'lucide-react'
 
 export default function Login() {
-  const { signIn, appUser } = useAuth()
+  const { signIn, appUser, passwordRecovery, clearPasswordRecovery } = useAuth()
   const { theme, toggle: toggleTheme } = useTheme()
   const toast = useToast()
   const [email, setEmail] = useState('')
@@ -19,6 +19,11 @@ export default function Login() {
   const [resetSent, setResetSent] = useState(false)
   const [resetLoading, setResetLoading] = useState(false)
   const [noAccount, setNoAccount] = useState(false)
+
+  // Password recovery state
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [updatingPassword, setUpdatingPassword] = useState(false)
 
   // Show session-expired toast when redirected from safeQuery
   useEffect(() => {
@@ -54,12 +59,43 @@ export default function Login() {
   async function handleReset(e: React.FormEvent) {
     e.preventDefault()
     setResetLoading(true)
-    const { error: err } = await supabase.auth.resetPasswordForEmail(resetEmail)
+    const { error: err } = await supabase.auth.resetPasswordForEmail(resetEmail, {
+      redirectTo: `${window.location.origin}/login`,
+    })
     setResetLoading(false)
     if (err) {
       setError(err.message)
     } else {
       setResetSent(true)
+    }
+  }
+
+  async function handleUpdatePassword(e: React.FormEvent) {
+    e.preventDefault()
+    setError('')
+
+    if (newPassword.length < 6) {
+      setError('Password must be at least 6 characters.')
+      return
+    }
+    if (newPassword !== confirmPassword) {
+      setError('Passwords do not match.')
+      return
+    }
+
+    setUpdatingPassword(true)
+    const { error: err } = await supabase.auth.updateUser({ password: newPassword })
+    setUpdatingPassword(false)
+
+    if (err) {
+      setError(err.message)
+    } else {
+      clearPasswordRecovery()
+      setNewPassword('')
+      setConfirmPassword('')
+      toast.success('Password updated successfully. Please sign in.')
+      // Sign out so user logs in with new password
+      await supabase.auth.signOut()
     }
   }
 
@@ -85,7 +121,41 @@ export default function Login() {
           <p className="mt-1 text-xs text-muted">Multi Co-Packer Manager</p>
         </div>
 
-        {showReset ? (
+        {passwordRecovery ? (
+          <form onSubmit={handleUpdatePassword} className="space-y-4">
+            <p className="text-sm text-text text-center">Enter your new password</p>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted">New Password</label>
+              <input
+                type="password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                required
+                className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-text placeholder:text-muted/50 focus:border-accent focus:outline-none"
+                placeholder="••••••••"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted">Confirm Password</label>
+              <input
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                required
+                className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm text-text placeholder:text-muted/50 focus:border-accent focus:outline-none"
+                placeholder="••••••••"
+              />
+            </div>
+            {error && <p className="text-xs text-red-400">{error}</p>}
+            <button
+              type="submit"
+              disabled={updatingPassword}
+              className="w-full rounded-lg bg-brand px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-brand-hover disabled:opacity-50"
+            >
+              {updatingPassword ? 'Updating...' : 'Update Password'}
+            </button>
+          </form>
+        ) : showReset ? (
           resetSent ? (
             <div className="text-center">
               <p className="text-sm text-green-400">Password reset email sent.</p>

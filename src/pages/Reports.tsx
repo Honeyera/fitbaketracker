@@ -29,18 +29,42 @@ import type {
   Recipe,
   PurchaseOrder,
   FinishedGoodsMovement,
+  RecipeIngredient,
+  Ingredient,
+  RecipeFreightSummary,
+  ProductionRunInvoice,
+  ReconciliationLine,
 } from '../types/database'
+import { loadConversions, type ConversionMap } from '../lib/conversions'
+import { calculateRecipeCOGS } from '../lib/recipeCosting'
+import TrueLandedCogsReport from '../components/TrueLandedCogsReport'
 
 /* ── Helpers ──────────────────────────────────────────────────── */
 
 import { fmt$, fmtRate } from '../lib/format'
+
+/* ── COGS table types ──────────────────────────────────────────── */
+
+type CogsFilter = 'all' | 'active' | 'complete'
+type CogsSortKey = 'sku' | 'name' | 'status' | 'ingredientCogs' | 'cpFee' | 'freight' | 'landedCogs'
+
+interface CogsRow {
+  recipe: Recipe
+  cpName: string | null
+  ingredientCogs: number | null
+  cpFee: number | null
+  freight: number | null
+  freightEstimated: boolean
+  landedCogs: number | null
+  isPartial: boolean
+  isComplete: boolean
+}
 
 /* ── Report card icons (text-based) ───────────────────────────── */
 
 const REPORT_CARDS = [
   { icon: '⊞', title: 'Co-Packer Comparison', desc: 'Side-by-side waste, on-time, cost across all CPs' },
   { icon: '△', title: 'Ingredient Reconciliation', desc: 'Sent vs used vs remaining, per CP and period' },
-  { icon: '◎', title: 'True Landed COGS', desc: 'Full cost including CP fee, freight, waste, FBA' },
   { icon: '▤', title: 'Inventory Valuation', desc: 'What you own, where it sits, at co-packers and fulfillment centers' },
   { icon: '◈', title: 'Lot Traceability', desc: 'PO → co-packer → finished unit → FBA/3PL' },
   { icon: '◰', title: 'Monthly P&L by SKU', desc: 'Revenue vs. landed COGS by product' },
@@ -55,22 +79,45 @@ export default function Reports() {
   const [recipes, setRecipes] = useState<Recipe[]>([])
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([])
   const [fgMovements, setFgMovements] = useState<FinishedGoodsMovement[]>([])
+  const [recipeIngredients, setRecipeIngredients] = useState<RecipeIngredient[]>([])
+  const [ingredients, setIngredients] = useState<Ingredient[]>([])
+  const [freightSummaries, setFreightSummaries] = useState<RecipeFreightSummary[]>([])
+  const [invoices, setInvoices] = useState<ProductionRunInvoice[]>([])
+  const [reconciliationLines, setReconciliationLines] = useState<ReconciliationLine[]>([])
+  const [conversions, setConversions] = useState<ConversionMap>(new Map())
   const [loading, setLoading] = useState(true)
   const toast = useToast()
 
+  /* ── COGS table UI state ─────────────────────────────────────── */
+  const [cogsFilter, setCogsFilter] = useState<CogsFilter>('all')
+  const [cogsSortKey, setCogsSortKey] = useState<CogsSortKey>('landedCogs')
+  const [cogsSortAsc, setCogsSortAsc] = useState(false)
+
   async function load() {
-    const [cpRes, runRes, recRes, poRes, mvRes] = await safeBatch(() => Promise.all([
+    const [cpRes, runRes, recRes, poRes, mvRes, riRes, ingRes, frRes, invRes, rlRes] = await safeBatch(() => Promise.all([
       supabase.from('co_packers').select('*').order('name'),
       supabase.from('production_runs').select('*').order('completed_date', { ascending: true }),
       supabase.from('recipes').select('*'),
       supabase.from('purchase_orders').select('*'),
       supabase.from('finished_goods_movements').select('*'),
+      supabase.from('recipe_ingredients').select('*'),
+      supabase.from('ingredients').select('*'),
+      supabase.from('recipe_freight_summary').select('*'),
+      supabase.from('production_run_invoices').select('*'),
+      supabase.from('reconciliation_lines').select('*'),
     ]))
     setCoPackers(cpRes.data ?? [])
     setRuns(runRes.data ?? [])
     setRecipes(recRes.data ?? [])
     setPurchaseOrders(poRes.data ?? [])
     setFgMovements(mvRes.data ?? [])
+    setRecipeIngredients(riRes.data ?? [])
+    setIngredients(ingRes.data ?? [])
+    setFreightSummaries(frRes.data ?? [])
+    setInvoices(invRes.data ?? [])
+    setReconciliationLines(rlRes.data ?? [])
+    const convs = await loadConversions()
+    setConversions(convs)
     setLoading(false)
   }
 
@@ -148,73 +195,146 @@ export default function Reports() {
     return coPackers.filter((cp) => codes.has(cp.short_code))
   }, [wasteTrendData, coPackers])
 
-  /* ── 3. Landed COGS by SKU ──────────────────────────────────── */
+  /* ── 3. Landed COGS by SKU (full table) ─────────────────────── */
 
-  const cogsCards = useMemo(() => {
-    // Count runs per recipe to sort by most-used
-    const runCountByRecipe: Record<string, number> = {}
-    for (const r of runs) {
-      if (r.recipe_id) {
-        runCountByRecipe[r.recipe_id] = (runCountByRecipe[r.recipe_id] ?? 0) + 1
+  const cogsRows = useMemo<CogsRow[]>(() => {
+    return recipes.map((recipe) => {
+      const cp = coPackers.find((c) => c.id === recipe.co_packer_id)
+
+      // ── Ingredient COGS ──
+      let ingredientCogs: number | null = null
+      if (recipe.ingredient_cogs != null && recipe.ingredient_cogs > 0) {
+        ingredientCogs = recipe.ingredient_cogs
+      } else {
+        // Calculate live from recipe_ingredients
+        const live = calculateRecipeCOGS(recipe.id, recipeIngredients, ingredients, conversions)
+        ingredientCogs = live > 0 ? live : null
       }
-    }
 
-    return recipes
-      .filter((r) => r.status === 'active')
-      .sort((a, b) => (runCountByRecipe[b.id] ?? 0) - (runCountByRecipe[a.id] ?? 0))
-      .slice(0, 4)
-      .map((recipe) => {
-        const cp = coPackers.find((c) => c.id === recipe.co_packer_id)
-        const ingredientCogs = recipe.ingredient_cogs ?? 0
-        const cpFee = cp?.fee_per_unit ?? 0
+      // ── Co-Packer Fee ──
+      let cpFee: number | null = null
+      // Check invoices for actual per_unit_cost
+      const recipeRuns = runs.filter((r) => r.recipe_id === recipe.id)
+      const runIds = new Set(recipeRuns.map((r) => r.id))
+      const recipeInvoices = invoices.filter(
+        (inv) => inv.per_unit_cost != null && inv.per_unit_cost > 0 && inv.production_run_id && runIds.has(inv.production_run_id),
+      )
+      if (recipeInvoices.length > 0) {
+        // Use average of actual invoice per_unit_cost
+        cpFee = recipeInvoices.reduce((s, inv) => s + (inv.per_unit_cost ?? 0), 0) / recipeInvoices.length
+      } else if (cp?.fee_per_unit != null && cp.fee_per_unit > 0) {
+        cpFee = cp.fee_per_unit
+      }
 
-        // Freight from actual movements
+      // ── Freight ──
+      let freight: number | null = null
+      let freightEstimated = false
+      // 1. From recipe_freight_summary
+      const freightSummary = freightSummaries.find((f) => f.recipe_id === recipe.id)
+      if (freightSummary?.avg_total_freight != null && freightSummary.avg_total_freight > 0) {
+        freight = freightSummary.avg_total_freight
+      } else {
+        // 2. From actual finished_goods_movements
         const recipeMoves = fgMovements.filter(
           (m) => m.recipe_id === recipe.id && m.shipping_cost != null && Number(m.shipping_cost) > 0,
         )
-        let freightPerUnit: number
-        let freightLabel = 'Freight'
         if (recipeMoves.length > 0) {
           const tc = recipeMoves.reduce((s, m) => s + Number(m.shipping_cost ?? 0), 0)
           const tq = recipeMoves.reduce((s, m) => s + m.quantity, 0)
-          freightPerUnit = tq > 0 ? tc / tq : 0
-          freightLabel = `Freight (${recipeMoves.length} shipments)`
+          freight = tq > 0 ? tc / tq : null
         } else if (recipe.estimated_freight_per_unit != null) {
-          freightPerUnit = Number(recipe.estimated_freight_per_unit)
-          freightLabel = 'Freight (est.)'
-        } else {
-          freightPerUnit = 0
-          freightLabel = 'Freight (none)'
+          // 3. From recipe estimated freight
+          freight = Number(recipe.estimated_freight_per_unit)
+          freightEstimated = true
         }
+      }
 
-        // Average waste cost per unit from reconciled runs for this recipe
-        const recipeReconciledRuns = runs.filter(
-          (r) => r.recipe_id === recipe.id && r.status === 'reconciled' && r.produced_quantity && r.produced_quantity > 0,
-        )
-        let wastePerUnit = 0
-        if (recipeReconciledRuns.length > 0) {
-          const totalWasteCost = recipeReconciledRuns.reduce((s, r) => s + (r.waste_cost ?? 0), 0)
-          const totalProduced = recipeReconciledRuns.reduce((s, r) => s + (r.produced_quantity ?? 0), 0)
-          wastePerUnit = totalProduced > 0 ? totalWasteCost / totalProduced : 0
-        }
+      // ── Landed COGS ──
+      const hasAllComponents = ingredientCogs != null && cpFee != null && freight != null
+      const landedCogs = (ingredientCogs ?? 0) + (cpFee ?? 0) + (freight ?? 0)
+      const isPartial = !hasAllComponents && landedCogs > 0
 
-        const total = ingredientCogs + cpFee + freightPerUnit + Math.abs(wastePerUnit)
-        const maxComponent = Math.max(ingredientCogs, cpFee, freightPerUnit, Math.abs(wastePerUnit), 0.01)
+      return {
+        recipe,
+        cpName: cp?.name ?? null,
+        ingredientCogs,
+        cpFee,
+        freight,
+        freightEstimated,
+        landedCogs: landedCogs > 0 ? landedCogs : null,
+        isPartial,
+        isComplete: hasAllComponents,
+      }
+    })
+  }, [recipes, coPackers, recipeIngredients, ingredients, conversions, runs, invoices, freightSummaries, fgMovements])
 
-        return {
-          recipe,
-          cp,
-          lines: [
-            { label: 'Ingredients', value: ingredientCogs, color: '#3B82F6', max: maxComponent },
-            { label: 'Co-Packer Fee', value: cpFee, color: '#F59E0B', max: maxComponent },
-            { label: freightLabel, value: freightPerUnit, color: '#06B6D4', max: maxComponent },
-            { label: 'Waste Allocated', value: Math.abs(wastePerUnit), color: '#EF4444', max: maxComponent },
-          ],
-          total,
-          runCount: runCountByRecipe[recipe.id] ?? 0,
-        }
-      })
-  }, [recipes, runs, coPackers, fgMovements])
+  // Filter
+  const filteredCogsRows = useMemo(() => {
+    let rows = cogsRows
+    if (cogsFilter === 'active') rows = rows.filter((r) => r.recipe.status === 'active')
+    if (cogsFilter === 'complete') rows = rows.filter((r) => r.isComplete)
+    return rows
+  }, [cogsRows, cogsFilter])
+
+  // Sort
+  const sortedCogsRows = useMemo(() => {
+    const sorted = [...filteredCogsRows].sort((a, b) => {
+      let va: number | string | null
+      let vb: number | string | null
+      switch (cogsSortKey) {
+        case 'sku': va = a.recipe.sku; vb = b.recipe.sku; break
+        case 'name': va = a.recipe.name; vb = b.recipe.name; break
+        case 'status': va = a.recipe.status ?? ''; vb = b.recipe.status ?? ''; break
+        case 'ingredientCogs': va = a.ingredientCogs; vb = b.ingredientCogs; break
+        case 'cpFee': va = a.cpFee; vb = b.cpFee; break
+        case 'freight': va = a.freight; vb = b.freight; break
+        case 'landedCogs': va = a.landedCogs; vb = b.landedCogs; break
+        default: va = a.landedCogs; vb = b.landedCogs
+      }
+      // Nulls sort last regardless of direction
+      if (va == null && vb == null) return 0
+      if (va == null) return 1
+      if (vb == null) return -1
+      if (typeof va === 'string' && typeof vb === 'string') {
+        return cogsSortAsc ? va.localeCompare(vb) : vb.localeCompare(va)
+      }
+      return cogsSortAsc ? (va as number) - (vb as number) : (vb as number) - (va as number)
+    })
+    return sorted
+  }, [filteredCogsRows, cogsSortKey, cogsSortAsc])
+
+  // Summary stats
+  const cogsSummary = useMemo(() => {
+    const total = cogsRows.length
+    const withComplete = cogsRows.filter((r) => r.isComplete).length
+    const missing = total - withComplete
+    const completeLanded = cogsRows.filter((r) => r.isComplete && r.landedCogs != null).map((r) => r.landedCogs!)
+    const avg = completeLanded.length > 0
+      ? completeLanded.reduce((s, v) => s + v, 0) / completeLanded.length
+      : null
+    let highest: CogsRow | null = null
+    let lowest: CogsRow | null = null
+    for (const r of cogsRows) {
+      if (r.landedCogs == null) continue
+      if (!highest || r.landedCogs > (highest.landedCogs ?? 0)) highest = r
+      if (!lowest || r.landedCogs < (lowest.landedCogs ?? Infinity)) lowest = r
+    }
+    return { total, withComplete, missing, avg, highest, lowest }
+  }, [cogsRows])
+
+  function handleCogsSort(key: CogsSortKey) {
+    if (cogsSortKey === key) {
+      setCogsSortAsc(!cogsSortAsc)
+    } else {
+      setCogsSortKey(key)
+      setCogsSortAsc(false)
+    }
+  }
+
+  function cogsSortIcon(key: CogsSortKey) {
+    if (cogsSortKey !== key) return ''
+    return cogsSortAsc ? ' ↑' : ' ↓'
+  }
 
   /* ── 4. Monthly Ingredient Spend ─────────────────────────────── */
 
@@ -449,60 +569,154 @@ export default function Reports() {
         </div>
       </div>
 
-      {/* ── Row 2: Landed COGS + Monthly Spend ──────────────────── */}
-      <div className="mb-6 grid gap-6 lg:grid-cols-2">
-        {/* LEFT — Landed COGS by SKU */}
-        <div className="rounded-xl border border-border bg-card">
-          <div className="border-b border-border px-5 py-3">
+      {/* ── Row 2: Landed COGS by SKU (full-width) ────────────────── */}
+      <div className="mb-6 rounded-xl border border-border bg-card">
+        <div className="border-b border-border px-5 py-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <h3 className="text-sm font-semibold text-text">Landed COGS by SKU</h3>
-          </div>
-          <div className="divide-y divide-border">
-            {cogsCards.length > 0 ? (
-              cogsCards.map(({ recipe, cp, lines, total, runCount }) => (
-                <div key={recipe.id} className="px-5 py-4">
-                  {/* Recipe header */}
-                  <div className="mb-3 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium text-text">{recipe.name}</span>
-                      <span className="font-mono text-xs text-muted">({recipe.sku})</span>
-                      {cp && <CPBadge coPackerId={cp.id} />}
-                    </div>
-                    <span className="text-[10px] text-muted">{runCount} runs</span>
-                  </div>
-
-                  {/* Cost lines */}
-                  <div className="space-y-2">
-                    {lines.map((line) => (
-                      <div key={line.label} className="flex items-center gap-3 text-xs">
-                        <span className="w-[100px] shrink-0 text-muted">{line.label}</span>
-                        <div className="flex-1">
-                          <MiniBar value={line.value} max={line.max} color={line.color} />
-                        </div>
-                        <span className="w-[60px] shrink-0 text-right font-mono text-text">
-                          {fmtRate(line.value)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Total */}
-                  <div className="mt-3 flex items-center justify-between border-t border-border pt-2">
-                    <span className="text-xs font-medium text-muted">Total Landed COGS</span>
-                    <span className="font-mono text-sm font-bold text-green-400">
-                      {fmtRate(total)}
-                    </span>
-                  </div>
-                </div>
-              ))
-            ) : (
-              <div className="px-5 py-8 text-center text-sm text-muted">
-                No active recipes
-              </div>
-            )}
+            <div className="flex gap-1">
+              {(['all', 'active', 'complete'] as CogsFilter[]).map((f) => (
+                <button
+                  key={f}
+                  onClick={() => setCogsFilter(f)}
+                  className={`rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                    cogsFilter === f
+                      ? 'bg-accent text-white'
+                      : 'bg-surface text-muted hover:text-text'
+                  }`}
+                >
+                  {f === 'all' ? 'All' : f === 'active' ? 'Active Only' : 'With Complete COGS'}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
-        {/* RIGHT — Monthly Ingredient Spend */}
+        {/* Summary strip */}
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-b border-border bg-surface/30 px-5 py-2.5 text-xs">
+          <span className="text-muted">
+            Total SKUs: <span className="font-mono font-medium text-text">{cogsSummary.total}</span>
+          </span>
+          <span className="text-muted">
+            With full COGS: <span className="font-mono font-medium text-green-400">{cogsSummary.withComplete}</span>
+          </span>
+          <span className="text-muted">
+            Missing data: <span className="font-mono font-medium text-amber-400">{cogsSummary.missing}</span>
+          </span>
+          <span className="mx-1 text-border">|</span>
+          <span className="text-muted">
+            Avg Landed COGS: <span className="font-mono font-medium text-text">{cogsSummary.avg != null ? fmtRate(cogsSummary.avg) : '—'}</span>
+          </span>
+          {cogsSummary.highest && (
+            <span className="text-muted">
+              Highest: <span className="font-mono text-text">{cogsSummary.highest.recipe.sku}</span>{' '}
+              <span className="font-mono text-red-400">({fmtRate(cogsSummary.highest.landedCogs)})</span>
+            </span>
+          )}
+          {cogsSummary.lowest && (
+            <span className="text-muted">
+              Lowest: <span className="font-mono text-text">{cogsSummary.lowest.recipe.sku}</span>{' '}
+              <span className="font-mono text-green-400">({fmtRate(cogsSummary.lowest.landedCogs)})</span>
+            </span>
+          )}
+        </div>
+
+        {/* Table */}
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b border-border bg-surface">
+                {([
+                  ['sku', 'SKU'],
+                  ['name', 'Product'],
+                  ['status', 'Status'],
+                  ['ingredientCogs', 'Ingredient COGS'],
+                  ['cpFee', 'CP Fee'],
+                  ['freight', 'Freight'],
+                  ['landedCogs', 'Landed COGS'],
+                ] as [CogsSortKey, string][]).map(([key, label]) => (
+                  <th
+                    key={key}
+                    onClick={() => handleCogsSort(key)}
+                    className={`cursor-pointer select-none whitespace-nowrap px-4 py-2.5 text-[10px] font-medium uppercase tracking-wider text-muted hover:text-text ${
+                      key === 'sku' || key === 'name' || key === 'status' ? 'text-left' : 'text-right'
+                    }`}
+                  >
+                    {label}{cogsSortIcon(key)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sortedCogsRows.length > 0 ? sortedCogsRows.map((row) => {
+                const isDraft = row.recipe.status === 'draft'
+                return (
+                  <tr
+                    key={row.recipe.id}
+                    className={`border-b border-border ${isDraft ? 'opacity-60' : ''} ${
+                      !row.isComplete ? 'border-l-2 border-l-amber-500/60' : ''
+                    }`}
+                  >
+                    <td className="whitespace-nowrap px-4 py-2.5 font-mono font-medium text-accent">
+                      {row.recipe.sku}
+                    </td>
+                    <td className="px-4 py-2.5 font-medium text-text">{row.recipe.name}</td>
+                    <td className="px-4 py-2.5">
+                      <span
+                        className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-medium capitalize ${
+                          row.recipe.status === 'active'
+                            ? 'bg-green-500/10 text-green-400'
+                            : row.recipe.status === 'draft'
+                              ? 'bg-gray-500/10 text-gray-400'
+                              : row.recipe.status === 'seasonal'
+                                ? 'bg-blue-500/10 text-blue-400'
+                                : row.recipe.status === 'discontinued'
+                                  ? 'bg-red-500/10 text-red-400'
+                                  : 'bg-gray-500/10 text-gray-400'
+                        }`}
+                      >
+                        {row.recipe.status ?? 'unknown'}
+                      </span>
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-2.5 text-right font-mono text-text">
+                      {row.ingredientCogs != null ? fmtRate(row.ingredientCogs) : <span className="text-muted">—</span>}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-2.5 text-right font-mono text-text">
+                      {row.cpFee != null ? fmtRate(row.cpFee) : <span className="text-muted">—</span>}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-2.5 text-right font-mono text-text">
+                      {row.freight != null ? (
+                        <span>{row.freightEstimated ? '~' : ''}{fmtRate(row.freight)}</span>
+                      ) : (
+                        <span className="text-muted">—</span>
+                      )}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-2.5 text-right font-mono font-bold">
+                      {row.landedCogs != null ? (
+                        <span className={row.isComplete ? 'text-green-400' : 'text-amber-400'}>
+                          {row.isPartial ? '~' : ''}{fmtRate(row.landedCogs)}
+                        </span>
+                      ) : (
+                        <span className="text-muted">—</span>
+                      )}
+                    </td>
+                  </tr>
+                )
+              }) : (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-sm text-muted">
+                    No recipes match the current filter
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── Row 3: Monthly Ingredient Spend ──────────────────────── */}
+      <div className="mb-6">
+        {/* Monthly Ingredient Spend */}
         <div className="rounded-xl border border-border bg-card">
           <div className="border-b border-border px-5 py-3">
             <h3 className="text-sm font-semibold text-text">Monthly Ingredient Spend</h3>
@@ -544,7 +758,23 @@ export default function Reports() {
         </div>
       </div>
 
-      {/* ── Row 3: Generate Reports ─────────────────────────────── */}
+      {/* ── Row 4: True Landed COGS ─────────────────────────────── */}
+      <div className="mb-6">
+        <TrueLandedCogsReport
+          recipes={recipes}
+          coPackers={coPackers}
+          runs={runs}
+          recipeIngredients={recipeIngredients}
+          ingredients={ingredients}
+          fgMovements={fgMovements}
+          freightSummaries={freightSummaries}
+          invoices={invoices}
+          reconciliationLines={reconciliationLines}
+          conversions={conversions}
+        />
+      </div>
+
+      {/* ── Row 5: Generate Reports ─────────────────────────────── */}
       <div className="rounded-xl border border-border bg-card">
         <div className="border-b border-border px-5 py-3">
           <h3 className="text-sm font-semibold text-text">Generate Reports</h3>

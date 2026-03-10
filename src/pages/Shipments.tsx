@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 import { safeBatch } from '../lib/safeQuery'
 import { safeLoad } from '../lib/safeLoad'
@@ -17,8 +18,11 @@ import { useAuth } from '../contexts/AuthContext'
 import { logActivity } from '../lib/activityLog'
 import { Plus, X, Trash2, ChevronRight } from 'lucide-react'
 import { syncIngredientStatus } from '../lib/syncIngredientStatus'
+import { syncShipmentToPO, backfillShipmentTrackingToPOs } from '../lib/poShipmentSync'
+import { syncAfterPOStatusChange } from '../lib/poStatusChange'
 import { sanitize } from '../lib/sanitizePayload'
 import { dbInsert, dbUpdate, dbDelete } from '../lib/dbWrite'
+import SupplierPopover from '../components/SupplierPopover'
 import type {
   ShipmentToCopacker,
   ShipmentItem,
@@ -28,6 +32,7 @@ import type {
   PurchaseOrderItem,
   IngredientInventory,
   Supplier,
+  SupplierContact,
   ProductionOrder,
   IngredientTag,
   IngredientTagLink,
@@ -70,6 +75,7 @@ interface Row extends Record<string, unknown> {
   shipment_number: string
   co_packer_id: string | null
   supplier_name: string
+  supplier_id: string | null
   ship_date: string | null
   received_date: string | null
   items: string
@@ -97,12 +103,14 @@ interface EditLine {
 export default function Shipments() {
   const toast = useToast()
   const { can, appUser } = useAuth()
+  const navigate = useNavigate()
 
   const [shipments, setShipments] = useState<ShipmentToCopacker[]>([])
   const [shipmentItems, setShipmentItems] = useState<ShipmentItem[]>([])
   const [ingredients, setIngredients] = useState<Ingredient[]>([])
   const [coPackers, setCoPackers] = useState<CoPacker[]>([])
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
+  const [supplierContacts, setSupplierContacts] = useState<SupplierContact[]>([])
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([])
   const [poItems, setPOItems] = useState<PurchaseOrderItem[]>([])
   const [inventory, setInventory] = useState<IngredientInventory[]>([])
@@ -143,12 +151,13 @@ export default function Shipments() {
   /* ── Data loading ─────────────────────────────────────────── */
 
   async function load() {
-    const [shipRes, itemsRes, ingRes, cpRes, supRes, poRes, poiRes, invRes, prodOrderRes, tagsRes, tagLinksRes] = await safeBatch(() => Promise.all([
+    const [shipRes, itemsRes, ingRes, cpRes, supRes, scRes, poRes, poiRes, invRes, prodOrderRes, tagsRes, tagLinksRes] = await safeBatch(() => Promise.all([
       supabase.from('shipments_to_copacker').select('*').order('created_at', { ascending: false }),
       supabase.from('shipment_items').select('*'),
       supabase.from('ingredients').select('*').order('name'),
       supabase.from('co_packers').select('*').order('name'),
       supabase.from('suppliers').select('*').order('name'),
+      supabase.from('supplier_contacts').select('*'),
       supabase.from('purchase_orders').select('*'),
       supabase.from('purchase_order_items').select('*'),
       supabase.from('ingredient_inventory').select('*'),
@@ -161,6 +170,7 @@ export default function Shipments() {
     setIngredients(ingRes.data ?? [])
     setCoPackers(cpRes.data ?? [])
     setSuppliers(supRes.data ?? [])
+    setSupplierContacts(scRes.data ?? [])
     setPurchaseOrders(poRes.data ?? [])
     setPOItems(poiRes.data ?? [])
     setInventory(invRes.data ?? [])
@@ -171,6 +181,12 @@ export default function Shipments() {
   }
 
   useEffect(() => safeLoad(load, setLoading), [])
+
+  // Backfill tracking from shipments → POs once on mount
+  useEffect(() => {
+    const t = setTimeout(() => { backfillShipmentTrackingToPOs() }, 3000)
+    return () => clearTimeout(t)
+  }, [])
 
   /* ── Derive status helper ───────────────────────────────── */
 
@@ -204,6 +220,16 @@ export default function Shipments() {
     return ''
   }
 
+  /** Resolve supplier_id: direct first, then via linked PO */
+  function getSupplierId(s: ShipmentToCopacker): string | null {
+    if (s.supplier_id) return s.supplier_id
+    if (s.purchase_order_id) {
+      const po = purchaseOrders.find((p) => p.id === s.purchase_order_id)
+      if (po?.supplier_id) return po.supplier_id
+    }
+    return null
+  }
+
   /** Resolve production order ID: direct field, then via linked PO */
   function resolveProductionOrderId(s: ShipmentToCopacker): string | null {
     if (s.production_order_id) return s.production_order_id
@@ -234,6 +260,7 @@ export default function Shipments() {
           shipment_number: s.shipment_number,
           co_packer_id: s.co_packer_id,
           supplier_name: getSupplierName(s),
+          supplier_id: getSupplierId(s),
           ship_date: s.ship_date,
           received_date: s.received_date,
           items: itemDescs.join(', '),
@@ -252,6 +279,10 @@ export default function Shipments() {
   /* ── Inventory helpers ──────────────────────────────────── */
 
   async function addInventoryForShipment(shipmentId: string, cpId: string | null) {
+    // Skip if shipment is linked to a PO — inventory is handled by processReceivedPOInventory
+    const ship = shipments.find((s) => s.id === shipmentId)
+    if (ship?.purchase_order_id) return
+
     const items = shipmentItems.filter((si) => si.shipment_id === shipmentId)
     for (const item of items) {
       if (!item.ingredient_id || item.quantity <= 0) continue
@@ -412,6 +443,15 @@ export default function Shipments() {
       }
 
       toast.success(`Shipment ${editShipment.shipment_number} updated`)
+
+      // Sync shared fields to linked PO (non-blocking)
+      syncShipmentToPO(editShipment.purchase_order_id, {
+        tracking_number: editForm.tracking_number || null,
+        carrier: editForm.carrier || null,
+        shipping_cost: editForm.shipping_cost ? Number(editForm.shipping_cost) : null,
+        status: newStatus,
+      }).then((msg) => { if (msg) toast.info(msg) })
+
       logActivity(appUser?.id, 'update_shipment', 'shipment', editShipment.id)
       const syncOrderId = editForm.production_order_id || editShipment.production_order_id
       if (syncOrderId) syncIngredientStatus(syncOrderId)
@@ -517,6 +557,10 @@ export default function Shipments() {
         'id', shipmentId)
       if (error) throw new Error(error.message)
 
+      // Sync status to linked PO (non-blocking)
+      syncShipmentToPO(s.purchase_order_id, { status: newStatus })
+        .then((msg) => { if (msg) toast.info(msg) })
+
       logActivity(appUser?.id, 'update_shipment_status', 'shipment', shipmentId, { status: newStatus })
       if (s.production_order_id) syncIngredientStatus(s.production_order_id)
       await load()
@@ -562,6 +606,10 @@ export default function Shipments() {
           }),
           'id', s.id)
         if (error) throw new Error(error.message)
+        // Sync confirmed → received on linked PO (non-blocking)
+        syncShipmentToPO(s.purchase_order_id, { status: 'confirmed' })
+        // Sync ingredient procurement status on linked production order (non-blocking)
+        if (s.production_order_id) syncIngredientStatus(s.production_order_id)
       }
       toast.success(`${receivedShipments.length} shipment(s) confirmed`)
       setConfirmBulk(false)
@@ -692,11 +740,17 @@ export default function Shipments() {
         label: 'From',
         key: 'supplier_name',
         width: '130px',
-        render: (row) => (
-          <span className="text-xs text-text">
-            {(row.supplier_name as string) || '\u2014'}
-          </span>
-        ),
+        render: (row) => {
+          const sup = row.supplier_id ? suppliers.find((s) => s.id === row.supplier_id) : null
+          if (!sup) return <span className="text-xs text-text">{(row.supplier_name as string) || '\u2014'}</span>
+          return (
+            <SupplierPopover
+              supplier={sup}
+              contacts={supplierContacts.filter((c) => c.supplier_id === sup.id)}
+              onViewSupplier={() => navigate('/suppliers')}
+            />
+          )
+        },
       },
       {
         label: 'Co-Packer',
@@ -760,11 +814,33 @@ export default function Shipments() {
         label: 'Tracking',
         key: 'tracking_number',
         width: '140px',
-        render: (row) => (
-          <span className="font-mono text-xs text-muted">
-            {(row.tracking_number as string) || '\u2014'}
-          </span>
-        ),
+        render: (row) => {
+          const raw = (row.tracking_number as string) || ''
+          if (!raw) return <span className="text-xs text-muted">—</span>
+          const nums = raw.split(/[,\n]+/).map((s) => s.trim()).filter(Boolean)
+          if (nums.length <= 1) {
+            return (
+              <span className="font-mono text-xs text-muted truncate block max-w-[130px]" title={raw}>
+                {raw}
+              </span>
+            )
+          }
+          return (
+            <div className="group relative" onClick={(e) => e.stopPropagation()}>
+              <span className="flex items-center gap-1 font-mono text-xs text-muted cursor-default">
+                <span className="truncate max-w-[90px]">{nums[0]}</span>
+                <span className="shrink-0 rounded-full bg-accent/15 text-accent px-1.5 py-0.5 text-[10px] font-semibold leading-none">
+                  +{nums.length - 1}
+                </span>
+              </span>
+              <div className="hidden group-hover:block absolute z-50 left-0 top-full mt-1 min-w-[200px] max-w-[300px] rounded-lg border border-border bg-card shadow-lg p-2 space-y-1">
+                {nums.map((n, i) => (
+                  <div key={i} className="font-mono text-xs text-text break-all">{n}</div>
+                ))}
+              </div>
+            </div>
+          )
+        },
       },
       {
         label: 'Status',

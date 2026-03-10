@@ -1,6 +1,23 @@
+import { Component, type ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom'
 import { useAuth } from './contexts/AuthContext'
 import LoadingScreen from './components/LoadingScreen'
+
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null }
+  static getDerivedStateFromError(error: Error) { return { error } }
+  render() {
+    if (this.state.error) return (
+      <div style={{ padding: 40, fontFamily: 'monospace', color: '#f87171', background: '#1a1a1a', minHeight: '100vh' }}>
+        <h1 style={{ fontSize: 20 }}>Page Error</h1>
+        <pre style={{ whiteSpace: 'pre-wrap', marginTop: 16, fontSize: 14 }}>{this.state.error.message}</pre>
+        <pre style={{ whiteSpace: 'pre-wrap', marginTop: 8, fontSize: 12, color: '#888' }}>{this.state.error.stack}</pre>
+        <button onClick={() => { this.setState({ error: null }); window.location.reload() }} style={{ marginTop: 16, padding: '8px 16px', background: '#3B82F6', color: 'white', border: 'none', borderRadius: 6, cursor: 'pointer' }}>Reload</button>
+      </div>
+    )
+    return this.props.children
+  }
+}
 import AppLayout from './layouts/AppLayout'
 import Dashboard from './pages/Dashboard'
 import CoPackers from './pages/CoPackers'
@@ -31,10 +48,10 @@ function ProtectedRoute() {
 }
 
 function PublicOnlyRoute() {
-  const { session, appUser, loading, needsSetup } = useAuth()
+  const { session, appUser, loading, needsSetup, passwordRecovery } = useAuth()
   if (loading) return <LoadingScreen />
   if (needsSetup) return <Navigate to="/setup" replace />
-  if (session && appUser) return <Navigate to="/" replace />
+  if (session && appUser && !passwordRecovery) return <Navigate to="/" replace />
   return <Outlet />
 }
 
@@ -50,6 +67,7 @@ function SetupRoute() {
 
 export default function App() {
   return (
+    <ErrorBoundary>
     <BrowserRouter>
       <Routes>
         {/* Public routes */}
@@ -84,5 +102,6 @@ export default function App() {
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
+    </ErrorBoundary>
   )
 }

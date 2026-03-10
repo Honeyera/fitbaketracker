@@ -192,7 +192,7 @@ function buildPurchaseOrdersSection(d: AllData): string {
 }
 
 function buildProductionSection(d: AllData): string {
-  const activeOrders = d.productionOrders.filter((o) => o.status !== 'completed' && o.status !== 'cancelled')
+  const activeOrders = d.productionOrders.filter((o) => o.status !== 'completed' && o.status !== 'complete' && o.status !== 'shipped' && o.status !== 'cancelled')
 
   let s = '## Active Production Orders\n'
   s += pad('Order#', 12) + pad('Co-Packer', 12) + pad('Status', 14) + pad('Ingredients', 12) + pad('Priority', 10) + padR('Total Units', 12) + padR('Est. Cost', 12) + '\n'

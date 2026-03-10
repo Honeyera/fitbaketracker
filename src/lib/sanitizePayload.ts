@@ -72,6 +72,18 @@ const TABLE_COLUMNS: Record<string, string[]> = {
     'id', 'name', 'sku', 'unit_cost', 'notes', 'created_at',
   ],
 
+  production_run_invoices: [
+    'id', 'production_run_id', 'production_order_id', 'co_packer_id',
+    'invoice_number', 'invoice_date', 'total_amount', 'per_unit_cost',
+    'notes', 'status', 'created_at',
+  ],
+
+  production_run_payments: [
+    'id', 'invoice_id', 'payment_type', 'amount', 'payment_date',
+    'payment_method', 'reference_number', 'notes', 'created_at',
+    'payment_method_used', 'card_used', 'processing_fee',
+  ],
+
   production_orders: [
     'id', 'order_number', 'co_packer_id', 'status', 'order_date',
     'requested_start_date', 'estimated_completion_date', 'priority', 'notes',
@@ -92,6 +104,12 @@ const TABLE_COLUMNS: Record<string, string[]> = {
     'package_size', 'package_unit',
   ],
 
+  po_payments: [
+    'id', 'purchase_order_id', 'payment_type', 'amount', 'payment_date',
+    'due_date', 'payment_method', 'reference_number', 'notes', 'status',
+    'created_at', 'payment_method_used', 'card_used', 'processing_fee',
+  ],
+
   purchase_orders: [
     'id', 'po_number', 'supplier_id', 'status', 'order_date', 'eta_date',
     'destination_type', 'destination_co_packer_id', 'total_cost',
@@ -99,6 +117,7 @@ const TABLE_COLUMNS: Record<string, string[]> = {
     'order_reference', 'payment_method', 'payment_status', 'shipping_cost',
     'shipping_method', 'shipping_carrier', 'shipping_per_unit_weight',
     'include_shipping_in_cost', 'production_order_id',
+    'payment_terms', 'payment_due_date', 'amount_paid', 'card_used', 'processing_fee',
   ],
 
   recipe_freight_summary: [
@@ -150,7 +169,7 @@ const TABLE_COLUMNS: Record<string, string[]> = {
 
   suppliers: [
     'id', 'name', 'lead_time_days', 'payment_terms', 'rating', 'notes',
-    'created_at',
+    'created_at', 'default_payment_method', 'default_card_used',
   ],
 
   unit_conversions: [

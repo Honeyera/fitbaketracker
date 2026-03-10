@@ -11,8 +11,11 @@ import Badge from '../components/Badge'
 import RecipeIcon from '../components/RecipeIcon'
 import { PageSkeleton } from '../components/Skeleton'
 import { fmt$, fmtNum, fmtDate } from '../lib/format'
-import { MapPin, AlertTriangle } from 'lucide-react'
+import { MapPin, AlertTriangle, DollarSign, ChevronDown, Check } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
+import { useToast } from '../components/Toast'
+import { dbInsert, dbUpdate } from '../lib/dbWrite'
+import { sanitize } from '../lib/sanitizePayload'
 import type {
   CoPacker,
   Ingredient,
@@ -24,6 +27,9 @@ import type {
   FinishedGoodsMovement,
   PurchaseOrder,
   PurchaseOrderItem,
+  ProductionRunInvoice,
+  ProductionRunPayment,
+  Supplier,
 } from '../types/database'
 import { loadConversions, getConversionFactorWithDensity, type ConversionMap } from '../lib/conversions'
 import { buildProcurementRows } from '../lib/procurement'
@@ -45,6 +51,7 @@ const DEFAULT_RUN_SIZE = 5000
 
 export default function Dashboard() {
   const { can } = useAuth()
+  const toast = useToast()
   const [coPackers, setCoPackers] = useState<CoPacker[]>([])
   const [ingredients, setIngredients] = useState<Ingredient[]>([])
   const [inventory, setInventory] = useState<IngredientInventory[]>([])
@@ -57,10 +64,19 @@ export default function Dashboard() {
   const [poItems, setPOItems] = useState<PurchaseOrderItem[]>([])
   const [productionOrders, setProductionOrders] = useState<ProductionOrder[]>([])
   const [conversions, setConversions] = useState<ConversionMap>(new Map())
+  const [cpInvoices, setCpInvoices] = useState<ProductionRunInvoice[]>([])
+  const [cpPayments, setCpPayments] = useState<ProductionRunPayment[]>([])
+  const [suppliers, setSuppliers] = useState<Supplier[]>([])
   const [cpFilter, setCpFilter] = useState('all')
+  const [paymentsDueOpen, setPaymentsDueOpen] = useState(true)
+  const [markingPaid, setMarkingPaid] = useState<string | null>(null)
+  const [quickPayMethod, setQuickPayMethod] = useState<Record<string, string>>({})
+
+  const QUICK_PAY_METHODS = ['Wire Transfer', 'ACH', 'Check', 'Credit Card', 'Melio', 'Cash']
+  const MELIO_FEE_PCT = 0.029
 
   async function load() {
-    const [cpRes, ingRes, invRes, runRes, recRes, riRes, mvRes, poRes, convMap, prodOrdRes, poItemsRes] = await safeBatch(() => Promise.all([
+    const [cpRes, ingRes, invRes, runRes, recRes, riRes, mvRes, poRes, convMap, prodOrdRes, poItemsRes, supRes] = await safeBatch(() => Promise.all([
       supabase.from('co_packers').select('*').order('name'),
       supabase.from('ingredients').select('*').order('name'),
       supabase.from('ingredient_inventory').select('*'),
@@ -72,6 +88,7 @@ export default function Dashboard() {
       loadConversions(),
       supabase.from('production_orders').select('*'),
       supabase.from('purchase_order_items').select('*'),
+      supabase.from('suppliers').select('*'),
     ]))
     setCoPackers(cpRes.data ?? [])
     setIngredients(ingRes.data ?? [])
@@ -84,6 +101,16 @@ export default function Dashboard() {
     setConversions(convMap)
     setProductionOrders(prodOrdRes.data ?? [])
     setPOItems(poItemsRes.data ?? [])
+    setSuppliers(supRes.data ?? [])
+    // Invoice data isolated so failures don't break the dashboard
+    try {
+      const [cpInvRes, cpPayRes] = await safeBatch(() => Promise.all([
+        supabase.from('production_run_invoices').select('*'),
+        supabase.from('production_run_payments').select('*'),
+      ]))
+      setCpInvoices(cpInvRes.data ?? [])
+      setCpPayments(cpPayRes.data ?? [])
+    } catch { /* invoice tables may not exist yet */ }
     setLoading(false)
   }
 
@@ -449,7 +476,7 @@ export default function Dashboard() {
 
     // 8. Production orders with un-procured ingredients
     for (const order of productionOrders.filter(
-      (o) => o.status !== 'complete' && o.status !== 'cancelled',
+      (o) => o.status !== 'complete' && o.status !== 'completed' && o.status !== 'shipped' && o.status !== 'cancelled',
     )) {
       if (cpFilter !== 'all' && order.co_packer_id !== cpFilter) continue
       if (!order.co_packer_id) continue
@@ -487,10 +514,175 @@ export default function Dashboard() {
       }
     }
 
+    // 9. CP invoices with outstanding balance
+    {
+      const activeOrders = new Set(
+        productionOrders
+          .filter((o) => o.status !== 'cancelled' && o.status !== 'complete' && o.status !== 'completed' && o.status !== 'shipped')
+          .map((o) => o.id),
+      )
+      const outstandingInvoices = cpInvoices.filter((inv) => {
+        if (!inv.production_order_id || !activeOrders.has(inv.production_order_id)) return false
+        if (cpFilter !== 'all') {
+          const order = productionOrders.find((o) => o.id === inv.production_order_id)
+          if (order?.co_packer_id !== cpFilter) return false
+        }
+        const invPayments = cpPayments.filter((p) => p.invoice_id === inv.id)
+        const totalPaid = invPayments.reduce((s, p) => s + Number(p.amount), 0)
+        return totalPaid < Number(inv.total_amount)
+      })
+      if (outstandingInvoices.length > 0) {
+        const totalDue = outstandingInvoices.reduce((sum, inv) => {
+          const invPayments = cpPayments.filter((p) => p.invoice_id === inv.id)
+          const totalPaid = invPayments.reduce((s, p) => s + Number(p.amount), 0)
+          return sum + Math.max(0, Number(inv.total_amount) - totalPaid)
+        }, 0)
+        items.push({
+          priority: 1,
+          color: '#F59E0B',
+          node: (
+            <span>
+              <span className="font-medium text-text">{outstandingInvoices.length} CP invoice{outstandingInvoices.length > 1 ? 's' : ''}</span>
+              <span className="text-muted"> with outstanding balance — {fmt$(totalDue)} due</span>
+            </span>
+          ),
+        })
+      }
+    }
+
     // Sort: red (0) first, amber (1), blue (2)
     items.sort((a, b) => a.priority - b.priority)
     return items.slice(0, 12)
-  }, [coPackers, ingredients, inventory, recipes, recipeIngredients, runs, purchaseOrders, movements, cpFilter, productionOrders, poItems, conversions])
+  }, [coPackers, ingredients, inventory, recipes, recipeIngredients, runs, purchaseOrders, movements, cpFilter, productionOrders, poItems, conversions, cpInvoices, cpPayments])
+
+  /* ── Payments Due ───────────────────────────────────────────── */
+
+  type PaymentDuePO = {
+    id: string
+    po_number: string
+    supplier_name: string
+    total_cost: number
+    amount_paid: number
+    balance: number
+    payment_due_date: string
+    days_relative: number // negative = overdue
+    category: 'overdue' | 'this_week' | 'upcoming'
+  }
+
+  const paymentsDue = useMemo(() => {
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const weekFromNow = new Date(today)
+    weekFromNow.setDate(weekFromNow.getDate() + 7)
+    const monthFromNow = new Date(today)
+    monthFromNow.setDate(monthFromNow.getDate() + 30)
+
+    const rows: PaymentDuePO[] = []
+    for (const po of purchaseOrders) {
+      const dueDate = (po as any).payment_due_date as string | null
+      const paymentStatus = (po as any).payment_status as string | null
+      if (!dueDate || paymentStatus === 'paid') continue
+
+      const due = new Date(dueDate + 'T00:00:00')
+      if (due > monthFromNow) continue // beyond 30 days
+
+      const totalCost = Number(po.total_cost ?? 0) + Number((po as any).shipping_cost ?? 0)
+      const amountPaid = Number((po as any).amount_paid ?? 0)
+      const balance = totalCost - amountPaid
+      if (balance <= 0) continue
+
+      const diffMs = due.getTime() - today.getTime()
+      const diffDays = Math.round(diffMs / 86_400_000)
+
+      const supplier = suppliers.find((s) => s.id === po.supplier_id)
+
+      let category: PaymentDuePO['category']
+      if (diffDays < 0) category = 'overdue'
+      else if (due <= weekFromNow) category = 'this_week'
+      else category = 'upcoming'
+
+      rows.push({
+        id: po.id,
+        po_number: po.po_number ?? '—',
+        supplier_name: supplier?.name ?? '—',
+        total_cost: totalCost,
+        amount_paid: amountPaid,
+        balance,
+        payment_due_date: dueDate,
+        days_relative: diffDays,
+        category,
+      })
+    }
+
+    rows.sort((a, b) => a.days_relative - b.days_relative)
+    return rows
+  }, [purchaseOrders, suppliers])
+
+  const overdueRows = paymentsDue.filter((r) => r.category === 'overdue')
+  const thisWeekRows = paymentsDue.filter((r) => r.category === 'this_week')
+  const upcomingRows = paymentsDue.filter((r) => r.category === 'upcoming')
+  const totalOutstanding = paymentsDue.reduce((s, r) => s + r.balance, 0)
+
+  async function handleQuickPay(po: PaymentDuePO) {
+    const method = quickPayMethod[po.id] || ''
+    const fee = method === 'Melio' ? parseFloat((po.balance * MELIO_FEE_PCT).toFixed(2)) : 0
+    setMarkingPaid(po.id)
+    try {
+      const { error: insErr } = await dbInsert('po_payments', sanitize('po_payments', {
+        purchase_order_id: po.id,
+        payment_type: 'Balance / Final Payment',
+        amount: po.balance,
+        payment_date: new Date().toISOString().split('T')[0],
+        status: 'paid',
+        payment_method_used: method || null,
+        processing_fee: fee,
+        notes: 'Marked paid from dashboard',
+      }))
+      if (insErr) throw insErr
+
+      const { error: updErr } = await dbUpdate('purchase_orders', sanitize('purchase_orders', {
+        amount_paid: po.total_cost,
+        payment_status: 'paid',
+      }), 'id', po.id)
+      if (updErr) throw updErr
+
+      toast.success(`${po.po_number} marked as paid`)
+      load()
+    } catch (err: any) {
+      toast.error(err?.message ?? 'Failed to mark paid')
+    } finally {
+      setMarkingPaid(null)
+    }
+  }
+
+  function QuickPayAction({ po }: { po: PaymentDuePO }) {
+    const method = quickPayMethod[po.id] || ''
+    const fee = method === 'Melio' ? po.balance * MELIO_FEE_PCT : 0
+    return (
+      <div className="ml-3 flex shrink-0 items-center gap-1.5">
+        <select
+          value={method}
+          onChange={(e) => setQuickPayMethod((prev) => ({ ...prev, [po.id]: e.target.value }))}
+          className="rounded border border-border bg-surface px-1.5 py-0.5 text-[11px] text-text outline-none"
+        >
+          <option value="">Method...</option>
+          {QUICK_PAY_METHODS.map((m) => <option key={m} value={m}>{m}</option>)}
+        </select>
+        {method === 'Melio' && fee > 0 && (
+          <span className="text-[10px] font-mono text-pink-400">+{fmt$(fee)}</span>
+        )}
+        <button
+          type="button"
+          onClick={() => handleQuickPay(po)}
+          disabled={markingPaid === po.id}
+          className="flex items-center gap-1 rounded-lg bg-green-600 px-2.5 py-1 text-[11px] font-medium text-white transition-colors hover:bg-green-500 disabled:opacity-50"
+        >
+          <Check size={12} />
+          {markingPaid === po.id ? 'Saving...' : 'Pay'}
+        </button>
+      </div>
+    )
+  }
 
   /* ── Recent / Active Runs ────────────────────────────────────── */
 
@@ -641,6 +833,157 @@ export default function Dashboard() {
           )
         })}
       </div>
+
+      {/* ── Payments Due Widget ──────────────────────────────────── */}
+      {can('view_costs') && (
+        <div className="mb-6 rounded-xl border border-border bg-card overflow-hidden">
+          {/* Header — clickable to collapse */}
+          <button
+            type="button"
+            onClick={() => setPaymentsDueOpen((v) => !v)}
+            className="flex w-full items-center justify-between border-b border-border px-5 py-3 text-left transition-colors hover:bg-surface/50"
+          >
+            <div className="flex items-center gap-2">
+              <DollarSign size={16} className="text-accent" />
+              <h3 className="text-sm font-semibold text-text">
+                Payments Due
+                {overdueRows.length > 0 && (
+                  <span className="ml-2 inline-flex items-center rounded-full bg-red-500/20 px-2 py-0.5 text-[11px] font-medium text-red-400">
+                    {overdueRows.length} overdue
+                  </span>
+                )}
+              </h3>
+            </div>
+            <ChevronDown
+              size={16}
+              className={`text-muted transition-transform duration-200 ${paymentsDueOpen ? '' : '-rotate-90'}`}
+            />
+          </button>
+
+          {paymentsDueOpen && (
+            paymentsDue.length === 0 ? (
+              <div className="px-5 py-8 text-center text-sm text-muted">
+                All payments up to date — no outstanding balances
+              </div>
+            ) : (
+              <div>
+                {/* Summary cards */}
+                <div className="flex flex-wrap gap-3 px-5 py-4">
+                  <div className="flex items-center gap-2 rounded-lg bg-red-500/10 px-3 py-2">
+                    <div className="h-2 w-2 rounded-full bg-red-500" />
+                    <span className="text-xs font-medium text-red-400">
+                      {overdueRows.length} Overdue
+                    </span>
+                    <span className="font-mono text-xs font-semibold text-red-400">
+                      {fmt$(overdueRows.reduce((s, r) => s + r.balance, 0))}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 rounded-lg bg-amber-500/10 px-3 py-2">
+                    <div className="h-2 w-2 rounded-full bg-amber-500" />
+                    <span className="text-xs font-medium text-amber-400">
+                      {thisWeekRows.length} Due This Week
+                    </span>
+                    <span className="font-mono text-xs font-semibold text-amber-400">
+                      {fmt$(thisWeekRows.reduce((s, r) => s + r.balance, 0))}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 rounded-lg bg-green-500/10 px-3 py-2">
+                    <div className="h-2 w-2 rounded-full bg-green-500" />
+                    <span className="text-xs font-medium text-green-400">
+                      {upcomingRows.length} Upcoming
+                    </span>
+                    <span className="font-mono text-xs font-semibold text-green-400">
+                      {fmt$(upcomingRows.reduce((s, r) => s + r.balance, 0))}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Overdue section */}
+                {overdueRows.length > 0 && (
+                  <>
+                    <div className="px-5 py-1.5">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-red-400">Overdue</p>
+                    </div>
+                    <div className="divide-y divide-border">
+                      {overdueRows.map((po) => (
+                        <div key={po.id} className="flex items-center justify-between px-5 py-2.5 border-l-2 border-l-red-500">
+                          <div className="flex items-center gap-4 min-w-0">
+                            <span className="font-mono text-xs font-medium text-text">{po.po_number}</span>
+                            <span className="truncate text-xs text-muted">{po.supplier_name}</span>
+                            <span className="font-mono text-xs font-semibold text-text">{fmt$(po.balance)}</span>
+                            <span className="text-xs text-muted">Due {fmtDate(po.payment_due_date)}</span>
+                            <span className="flex items-center gap-1 text-xs font-medium text-red-400">
+                              <AlertTriangle size={12} />
+                              {Math.abs(po.days_relative)} day{Math.abs(po.days_relative) !== 1 ? 's' : ''} late
+                            </span>
+                          </div>
+                          <QuickPayAction po={po} />
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {/* Due This Week section */}
+                {thisWeekRows.length > 0 && (
+                  <>
+                    <div className="px-5 py-1.5">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-amber-400">Due This Week</p>
+                    </div>
+                    <div className="divide-y divide-border">
+                      {thisWeekRows.map((po) => (
+                        <div key={po.id} className="flex items-center justify-between px-5 py-2.5 border-l-2 border-l-amber-500">
+                          <div className="flex items-center gap-4 min-w-0">
+                            <span className="font-mono text-xs font-medium text-text">{po.po_number}</span>
+                            <span className="truncate text-xs text-muted">{po.supplier_name}</span>
+                            <span className="font-mono text-xs font-semibold text-text">{fmt$(po.balance)}</span>
+                            <span className="text-xs text-muted">Due {fmtDate(po.payment_due_date)}</span>
+                            <span className="text-xs text-muted">
+                              {po.days_relative === 0 ? 'today' : `in ${po.days_relative} day${po.days_relative !== 1 ? 's' : ''}`}
+                            </span>
+                          </div>
+                          <QuickPayAction po={po} />
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {/* Upcoming section */}
+                {upcomingRows.length > 0 && (
+                  <>
+                    <div className="px-5 py-1.5">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-green-400">Upcoming (next 30 days)</p>
+                    </div>
+                    <div className="divide-y divide-border">
+                      {upcomingRows.map((po) => (
+                        <div key={po.id} className="flex items-center justify-between px-5 py-2.5">
+                          <div className="flex items-center gap-4 min-w-0">
+                            <span className="font-mono text-xs font-medium text-text">{po.po_number}</span>
+                            <span className="truncate text-xs text-muted">{po.supplier_name}</span>
+                            <span className="font-mono text-xs font-semibold text-text">{fmt$(po.balance)}</span>
+                            <span className="text-xs text-muted">Due {fmtDate(po.payment_due_date)}</span>
+                            <span className="text-xs text-muted">in {po.days_relative} days</span>
+                          </div>
+                          <QuickPayAction po={po} />
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {/* Total Outstanding */}
+                <div className={`flex items-center justify-between border-t border-border px-5 py-3 ${overdueRows.length > 0 ? 'bg-red-500/5' : 'bg-surface/30'}`}>
+                  <span className="text-xs font-semibold text-text">Total Outstanding</span>
+                  <span className={`font-mono text-sm font-bold ${overdueRows.length > 0 ? 'text-red-400' : 'text-text'}`}>
+                    {fmt$(totalOutstanding)}
+                  </span>
+                </div>
+              </div>
+            )
+          )}
+        </div>
+      )}
 
       {/* ── Two-column grid ─────────────────────────────────────── */}
       <div className="grid gap-6 lg:grid-cols-2">

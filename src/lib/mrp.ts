@@ -256,6 +256,7 @@ export interface ResolvedSupplierInfo {
     supplierId: string
     supplierName: string
     siId: string
+    isDefault?: boolean
   }>
   packageOptions: PackageOption[]
   selectedSupplierId: string | null
@@ -281,6 +282,7 @@ export function resolveIngredientSupplier(
     supplierId: o.supplierId,
     supplierName: o.supplierName,
     siId: o.siId ?? '',
+    isDefault: o.isDefault,
   }))
 
   const defaultSupplier = supplierOpts[0] ?? null
@@ -346,11 +348,11 @@ export function findSupplierOptions(
   const options: SupplierOption[] = []
   for (const si of sis) {
     const sup = suppliers.find((s) => s.id === si.supplier_id)
-    if (!sup || si.price_per_unit == null) continue
+    if (!sup) continue
 
     const priceUnit = si.price_unit ?? ingredientUnit
-    let pricePerUnit = si.price_per_unit
-    if (priceUnit !== ingredientUnit) {
+    let pricePerUnit = si.price_per_unit ?? 0
+    if (si.price_per_unit != null && priceUnit !== ingredientUnit) {
       try {
         const factor = getConversionFactorWithDensity(conversions, priceUnit, ingredientUnit, density ?? null)
         pricePerUnit = si.price_per_unit / factor
@@ -363,7 +365,7 @@ export function findSupplierOptions(
       supplierId: sup.id,
       supplierName: sup.name,
       pricePerUnit,
-      rawPrice: si.price_per_unit,
+      rawPrice: si.price_per_unit ?? 0,
       priceUnit,
       siId: si.id,
       isDefault: si.is_default ?? undefined,
@@ -373,7 +375,12 @@ export function findSupplierOptions(
     })
   }
 
-  options.sort((a, b) => a.pricePerUnit - b.pricePerUnit)
+  // Sort: is_default first, then by price (cheapest first)
+  options.sort((a, b) => {
+    if (a.isDefault && !b.isDefault) return -1
+    if (!a.isDefault && b.isDefault) return 1
+    return a.pricePerUnit - b.pricePerUnit
+  })
 
   if (allOptions) return options
 

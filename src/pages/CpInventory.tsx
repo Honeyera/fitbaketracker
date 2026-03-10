@@ -16,7 +16,7 @@ import { fmt$, fmtNum } from '../lib/format'
 import { useAuth } from '../contexts/AuthContext'
 import { logActivity } from '../lib/activityLog'
 import CostGuard from '../components/CostGuard'
-import { ClipboardCheck, MapPin, Pencil, ClipboardList, Plus, Upload, Trash2 } from 'lucide-react'
+import { ClipboardCheck, MapPin, Pencil, ClipboardList, Plus, Upload, Trash2, RefreshCw } from 'lucide-react'
 import type {
   CoPacker,
   Ingredient,
@@ -33,6 +33,7 @@ import type {
 import { loadConversions, getConversionFactorWithDensity, type ConversionMap } from '../lib/conversions'
 import { sanitize } from '../lib/sanitizePayload'
 import { dbInsert, dbUpdate, dbDelete } from '../lib/dbWrite'
+import { processReceivedPOInventory } from '../lib/processReceivedPO'
 
 /* ── Row types ──────────────────────────────────────────────── */
 
@@ -129,6 +130,7 @@ export default function CpInventory() {
   const [cpFilter, setCpFilter] = useState('all')
   const [loading, setLoading] = useState(true)
   const [conversions, setConversions] = useState<ConversionMap>(new Map())
+  const [costHistory, setCostHistory] = useState<any[]>([])
   const toast = useToast()
 
   /* ── Inline edit state ──────────────────────────────────────── */
@@ -173,6 +175,11 @@ export default function CpInventory() {
   const [deleteInvCPId, setDeleteInvCPId] = useState<string | null>(null)
   const [deleteInvSaving, setDeleteInvSaving] = useState(false)
 
+  /* ── Backfill state ───────────────────────────────────────── */
+  const [showBackfillConfirm, setShowBackfillConfirm] = useState(false)
+  const [backfilling, setBackfilling] = useState(false)
+  const [backfillLog, setBackfillLog] = useState<string[]>([])
+
   /* ── Inline quantity edit state ─────────────────────────────── */
   const [inlineEditId, setInlineEditId] = useState<string | null>(null)
   const [inlineEditValue, setInlineEditValue] = useState('')
@@ -181,7 +188,7 @@ export default function CpInventory() {
   /* ── Data loading ───────────────────────────────────────────── */
 
   async function load() {
-    const [cpRes, ingRes, invRes, recRes, riRes, shipRes, pmRes, piRes, adjRes, convMap, tagsRes, tagLinksRes] = await safeBatch(() => Promise.all([
+    const [cpRes, ingRes, invRes, recRes, riRes, shipRes, pmRes, piRes, adjRes, convMap, tagsRes, tagLinksRes, costHistRes] = await safeBatch(() => Promise.all([
       supabase.from('co_packers').select('*').order('name'),
       supabase.from('ingredients').select('*').order('name'),
       supabase.from('ingredient_inventory').select('*'),
@@ -194,6 +201,7 @@ export default function CpInventory() {
       loadConversions(),
       supabase.from('ingredient_tags').select('*').order('name'),
       supabase.from('ingredient_tag_links').select('*'),
+      supabase.from('ingredient_cost_history').select('*, purchase_orders(po_number)').order('date', { ascending: false }),
     ]))
     setCoPackers(cpRes.data ?? [])
     setIngredients(ingRes.data ?? [])
@@ -207,10 +215,174 @@ export default function CpInventory() {
     setConversions(convMap)
     setTags(tagsRes.data ?? [])
     setTagLinks(tagLinksRes.data ?? [])
+    setCostHistory(costHistRes.data ?? [])
     setLoading(false)
   }
 
   useEffect(() => safeLoad(load, setLoading), [])
+
+  /* ── Backfill inventory from all received POs ────────────── */
+
+  async function backfillInventory() {
+    setBackfilling(true)
+    setBackfillLog(['Starting backfill...'])
+    try {
+      // Step 0: Merge duplicate inventory rows (same ingredient + same CP)
+      setBackfillLog((l) => [...l, 'Checking for duplicate inventory rows...'])
+      const { data: allInv } = await supabase
+        .from('ingredient_inventory')
+        .select('*')
+        .eq('location_type', 'copacker')
+      if (allInv && allInv.length > 0) {
+        const dupeMap = new Map<string, typeof allInv>()
+        for (const row of allInv) {
+          const key = `${row.ingredient_id}__${row.co_packer_id}`
+          const arr = dupeMap.get(key)
+          if (arr) arr.push(row)
+          else dupeMap.set(key, [row])
+        }
+        let mergedCount = 0
+        for (const [, rows] of dupeMap) {
+          if (rows.length <= 1) continue
+          // Keep the first row, merge quantities, delete the rest
+          const keeper = rows[0]
+          const extraQty = rows.slice(1).reduce((s, r) => s + (r.quantity ?? 0), 0)
+          const newQty = (keeper.quantity ?? 0) + extraQty
+          await dbUpdate('ingredient_inventory',
+            sanitize('ingredient_inventory', { quantity: newQty, updated_at: new Date().toISOString() }),
+            'id', keeper.id)
+          for (const dup of rows.slice(1)) {
+            await dbDelete('ingredient_inventory', 'id', dup.id)
+          }
+          const ingName = ingredients.find((i) => i.id === keeper.ingredient_id)?.name ?? keeper.ingredient_id
+          setBackfillLog((l) => [...l, `  Merged ${rows.length} rows for ${ingName} → ${Math.round(newQty)}`])
+          mergedCount += rows.length - 1
+        }
+        if (mergedCount > 0) {
+          setBackfillLog((l) => [...l, `Merged ${mergedCount} duplicate row(s).`])
+        } else {
+          setBackfillLog((l) => [...l, 'No duplicates found.'])
+        }
+      }
+
+      const { data: receivedPOs } = await supabase
+        .from('purchase_orders')
+        .select('id, po_number')
+        .eq('status', 'received')
+        .order('order_date')
+      if (!receivedPOs || receivedPOs.length === 0) {
+        setBackfillLog((l) => [...l, 'No received POs found.'])
+        setBackfilling(false)
+        return
+      }
+      setBackfillLog((l) => [...l, `Found ${receivedPOs.length} received POs.`])
+
+      let totalProcessed = 0
+      let totalSkipped = 0
+      let totalErrors = 0
+
+      for (const po of receivedPOs) {
+        const result = await processReceivedPOInventory(po.id, conversions)
+        if (result.skipped > 0) {
+          setBackfillLog((l) => [...l, `${po.po_number}: already processed — skipped`])
+          totalSkipped++
+        } else if (result.errors.length > 0) {
+          setBackfillLog((l) => [...l, `${po.po_number}: ${result.errors.join('; ')}`])
+          totalErrors++
+        } else if (result.processed > 0) {
+          setBackfillLog((l) => [...l, `${po.po_number}: processed ${result.processed} item(s)`])
+          totalProcessed++
+        } else {
+          setBackfillLog((l) => [...l, `${po.po_number}: no items to process`])
+        }
+      }
+
+      setBackfillLog((l) => [
+        ...l,
+        `Done! Processed: ${totalProcessed}, Skipped: ${totalSkipped}, Errors: ${totalErrors}`,
+      ])
+      toast.success(`Backfill complete — ${totalProcessed} POs processed, ${totalSkipped} skipped`)
+      await load()
+    } catch (err) {
+      setBackfillLog((l) => [...l, `Fatal error: ${err instanceof Error ? err.message : 'unknown'}`])
+      toast.error('Backfill failed')
+    } finally {
+      setBackfilling(false)
+    }
+  }
+
+  /**
+   * Fix double-counted inventory.
+   * Recalculates each CP inventory row from ground truth:
+   *   correct qty = last manual adjustment "new_quantity" + sum of PO receipts AFTER that adjustment
+   * If no adjustments exist, uses just the PO receipts total.
+   */
+  async function fixDoubleCountedInventory() {
+    setBackfilling(true)
+    setBackfillLog(['Fixing double-counted inventory...'])
+    try {
+      // Load all the source data
+      const [invRes, adjRes, costHistRes] = await Promise.all([
+        supabase.from('ingredient_inventory').select('*').eq('location_type', 'copacker'),
+        supabase.from('inventory_adjustments').select('*').eq('location_type', 'copacker').order('created_at', { ascending: false }),
+        supabase.from('ingredient_cost_history').select('*, purchase_orders(po_number, destination_co_packer_id)'),
+      ])
+      const allInv = invRes.data ?? []
+      const allAdj = adjRes.data ?? []
+      const allCostHist = costHistRes.data ?? []
+
+      let fixedCount = 0
+      for (const invRow of allInv) {
+        const ingName = ingredients.find((i) => i.id === invRow.ingredient_id)?.name ?? invRow.ingredient_id
+
+        // Find the most recent manual adjustment for this ingredient at this CP
+        const lastAdj = allAdj.find(
+          (a) => a.ingredient_id === invRow.ingredient_id && a.co_packer_id === invRow.co_packer_id,
+        )
+        const baseQty = lastAdj?.new_quantity ?? 0
+        const baseDate = lastAdj?.created_at ?? '1970-01-01'
+
+        // Sum PO receipts for this ingredient at this CP AFTER the last adjustment
+        const poQty = allCostHist
+          .filter((ch) => {
+            if (ch.ingredient_id !== invRow.ingredient_id) return false
+            const poDestCp = ch.purchase_orders?.destination_co_packer_id
+            if (poDestCp !== invRow.co_packer_id) return false
+            // Only count PO receipts after the last manual adjustment
+            if (lastAdj && ch.date) {
+              return new Date(ch.date) >= new Date(baseDate)
+            }
+            return true
+          })
+          .reduce((s, ch) => s + (ch.quantity ?? 0), 0)
+
+        const correctQty = baseQty + poQty
+        const currentQty = invRow.quantity ?? 0
+        const diff = Math.abs(currentQty - correctQty)
+
+        if (diff > 0.5) {
+          setBackfillLog((l) => [...l, `${ingName}: ${Math.round(currentQty)} → ${Math.round(correctQty)} (base: ${Math.round(baseQty)} + PO: ${Math.round(poQty)})`])
+          await dbUpdate('ingredient_inventory',
+            sanitize('ingredient_inventory', { quantity: correctQty, updated_at: new Date().toISOString() }),
+            'id', invRow.id)
+          fixedCount++
+        }
+      }
+
+      if (fixedCount === 0) {
+        setBackfillLog((l) => [...l, 'All inventory quantities are correct — no fixes needed.'])
+      } else {
+        setBackfillLog((l) => [...l, `Fixed ${fixedCount} ingredient(s).`])
+      }
+      toast.success(`Inventory fix complete — ${fixedCount} corrected`)
+      await load()
+    } catch (err) {
+      setBackfillLog((l) => [...l, `Error: ${err instanceof Error ? err.message : 'unknown'}`])
+      toast.error('Fix failed')
+    } finally {
+      setBackfilling(false)
+    }
+  }
 
   function ingTagLabel(ingredientId: string): string {
     const ingTags = tagLinks
@@ -258,13 +430,31 @@ export default function CpInventory() {
     const cpInv = inventory.filter(
       (iv) => iv.location_type === 'copacker' && iv.co_packer_id === cpId,
     )
+
+    // Aggregate duplicate inventory rows for the same ingredient
+    const aggMap = new Map<string, { id: string; ingredient_id: string; quantity: number; lot_number: string | null }>()
+    for (const iv of cpInv) {
+      const existing = aggMap.get(iv.ingredient_id)
+      if (existing) {
+        existing.quantity += iv.quantity ?? 0
+        if (iv.lot_number && !existing.lot_number) existing.lot_number = iv.lot_number
+      } else {
+        aggMap.set(iv.ingredient_id, {
+          id: iv.id,
+          ingredient_id: iv.ingredient_id,
+          quantity: iv.quantity ?? 0,
+          lot_number: iv.lot_number ?? null,
+        })
+      }
+    }
+
     const cpRecipes = recipes.filter((r) => r.co_packer_id === cpId)
     const cpRecipeIds = new Set(cpRecipes.map((r) => r.id))
     const cpRI = recipeIngredients.filter((ri) => cpRecipeIds.has(ri.recipe_id) && ri.provided_by !== 'copacker')
 
-    return cpInv.map((iv) => {
+    return [...aggMap.values()].map((iv) => {
       const ing = ingredients.find((i) => i.id === iv.ingredient_id)
-      const qty = iv.quantity ?? 0
+      const qty = iv.quantity
       const unitCost = ing?.unit_cost ?? 0
       const value = qty * unitCost
 
@@ -658,18 +848,38 @@ export default function CpInventory() {
         ? `${fmtNum(Math.round(enteredQty))} ${enteredUnit} → ${fmtNum(Math.round(storedQty))} ${baseUnit}`
         : `${fmtNum(Math.round(storedQty))} ${baseUnit}`
 
-      const { error: invErr } = await dbInsert('ingredient_inventory',
-        sanitize('ingredient_inventory', {
-          ingredient_id: addIngForm.ingredientId,
-          location_type: 'copacker',
-          co_packer_id: addIngCP,
-          quantity: storedQty,
-          lot_number: addIngForm.lotNumber || null,
-          expiration_date: addIngForm.expirationDate || null,
-          last_count_date: new Date().toISOString(),
-        }),
+      // Check if inventory row already exists for this ingredient at this CP
+      const existingInv = inventory.find(
+        (iv) => iv.ingredient_id === addIngForm.ingredientId
+          && iv.location_type === 'copacker'
+          && iv.co_packer_id === addIngCP,
       )
-      if (invErr) throw invErr
+
+      if (existingInv) {
+        // Update existing row — add to current quantity
+        const { error: invErr } = await dbUpdate('ingredient_inventory',
+          sanitize('ingredient_inventory', {
+            quantity: (existingInv.quantity ?? 0) + storedQty,
+            lot_number: addIngForm.lotNumber || existingInv.lot_number || null,
+            expiration_date: addIngForm.expirationDate || null,
+            last_count_date: new Date().toISOString(),
+          }),
+        'id', existingInv.id)
+        if (invErr) throw invErr
+      } else {
+        const { error: invErr } = await dbInsert('ingredient_inventory',
+          sanitize('ingredient_inventory', {
+            ingredient_id: addIngForm.ingredientId,
+            location_type: 'copacker',
+            co_packer_id: addIngCP,
+            quantity: storedQty,
+            lot_number: addIngForm.lotNumber || null,
+            expiration_date: addIngForm.expirationDate || null,
+            last_count_date: new Date().toISOString(),
+          }),
+        )
+        if (invErr) throw invErr
+      }
 
       // Audit trail (non-blocking)
       try {
@@ -1312,6 +1522,14 @@ export default function CpInventory() {
         title="Co-Packer Inventory"
         subtitle="Your materials in co-packer custody"
       >
+<button
+          onClick={() => setShowBackfillConfirm(true)}
+          className="flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium text-white transition-colors hover:opacity-90"
+          style={{ backgroundColor: '#E91E7B' }}
+        >
+          <RefreshCw size={16} />
+          Recalculate from POs
+        </button>
         <button
           onClick={() => { toast.success('Count request sent to all co-packers') }}
           className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent-hover"
@@ -1421,47 +1639,137 @@ export default function CpInventory() {
                   emptyHint="Ship ingredients to start tracking"
                 />
 
-                {/* Expanded ingredient adjustment history */}
+                {/* Expanded ingredient adjustment history + diagnostics */}
                 {ingRows.some((r) => expandedIngId === r.id) && (() => {
                   const row = ingRows.find((r) => expandedIngId === r.id)!
                   const rowAdj = adjustments.filter((a) => a.ingredient_id === row.ingredient_id && a.co_packer_id === cp.id)
-                  if (rowAdj.length === 0) return (
-                    <div className="mb-2 rounded-lg border border-border bg-surface/30 px-4 py-3 text-xs text-muted">
-                      No adjustment history for {row.name}
-                    </div>
+
+                  // Diagnostic: show raw inventory rows for this ingredient at this CP
+                  const rawInvRows = inventory.filter(
+                    (iv) => iv.ingredient_id === row.ingredient_id && iv.location_type === 'copacker' && iv.co_packer_id === cp.id,
                   )
+                  const hasDuplicates = rawInvRows.length > 1
+
                   return (
-                    <div className="mb-2 rounded-lg border border-border bg-surface/30 overflow-hidden">
-                      <p className="px-4 py-2 text-[10px] font-medium uppercase tracking-wider text-muted border-b border-border">
-                        Adjustment History — {row.name}
-                      </p>
-                      <table className="w-full text-xs">
-                        <thead>
-                          <tr className="border-b border-border text-muted">
-                            <th className="px-3 py-1.5 text-left font-medium">Date</th>
-                            <th className="px-3 py-1.5 text-right font-medium">Previous</th>
-                            <th className="px-3 py-1.5 text-right font-medium">Actual</th>
-                            <th className="px-3 py-1.5 text-right font-medium">Diff</th>
-                            <th className="px-3 py-1.5 text-left font-medium">Reason</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {rowAdj.slice(0, 10).map((a) => {
-                            const diffColor = (a.difference ?? 0) > 0 ? 'text-green-400' : (a.difference ?? 0) < 0 ? 'text-red-400' : 'text-muted'
-                            return (
-                              <tr key={a.id} className="border-b border-border last:border-0">
-                                <td className="px-3 py-1.5 text-muted">{a.created_at ? format(new Date(a.created_at), 'MMM d, yyyy') : '—'}</td>
-                                <td className="px-3 py-1.5 text-right font-mono text-muted">{a.previous_quantity != null ? fmtNum(Math.round(a.previous_quantity)) : '—'}</td>
-                                <td className="px-3 py-1.5 text-right font-mono text-text">{a.new_quantity != null ? fmtNum(Math.round(a.new_quantity)) : '—'}</td>
-                                <td className={`px-3 py-1.5 text-right font-mono font-medium ${diffColor}`}>
-                                  {a.difference != null && a.difference !== 0 ? `${a.difference > 0 ? '+' : ''}${fmtNum(Math.round(a.difference))}` : '—'}
-                                </td>
-                                <td className="px-3 py-1.5 text-muted truncate max-w-[200px]" title={a.reason ?? ''}>{a.reason ?? '—'}</td>
+                    <div className="mb-2 space-y-2">
+                      {/* Raw inventory rows diagnostic */}
+                      <div className="rounded-lg border border-border bg-surface/30 overflow-hidden">
+                        <p className="px-4 py-2 text-[10px] font-medium uppercase tracking-wider text-muted border-b border-border">
+                          Inventory Breakdown — {row.name}
+                          {hasDuplicates && <span className="ml-2 text-yellow-400">(⚠ {rawInvRows.length} duplicate rows found!)</span>}
+                        </p>
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="border-b border-border text-muted">
+                              <th className="px-3 py-1.5 text-left font-medium">Row ID</th>
+                              <th className="px-3 py-1.5 text-right font-medium">Quantity</th>
+                              <th className="px-3 py-1.5 text-left font-medium">Lot</th>
+                              <th className="px-3 py-1.5 text-left font-medium">Updated</th>
+                              <th className="px-3 py-1.5 text-left font-medium">Last Count</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {rawInvRows.map((iv) => (
+                              <tr key={iv.id} className="border-b border-border last:border-0">
+                                <td className="px-3 py-1.5 text-muted font-mono text-[10px]">{iv.id.slice(0, 8)}…</td>
+                                <td className="px-3 py-1.5 text-right font-mono text-text font-medium">{fmtNum(Math.round(iv.quantity ?? 0))} {row.unit}</td>
+                                <td className="px-3 py-1.5 text-muted">{iv.lot_number ?? '—'}</td>
+                                <td className="px-3 py-1.5 text-muted">{iv.updated_at ? format(new Date(iv.updated_at), 'MMM d, h:mm a') : '—'}</td>
+                                <td className="px-3 py-1.5 text-muted">{iv.last_count_date ? format(new Date(iv.last_count_date), 'MMM d') : '—'}</td>
                               </tr>
-                            )
-                          })}
-                        </tbody>
-                      </table>
+                            ))}
+                            {rawInvRows.length > 1 && (
+                              <tr className="bg-yellow-500/10">
+                                <td className="px-3 py-1.5 text-yellow-400 font-medium">TOTAL</td>
+                                <td className="px-3 py-1.5 text-right font-mono text-yellow-400 font-medium">
+                                  {fmtNum(Math.round(rawInvRows.reduce((s, iv) => s + (iv.quantity ?? 0), 0)))} {row.unit}
+                                </td>
+                                <td colSpan={3}></td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      {/* PO processing history (from ingredient_cost_history) */}
+                      {(() => {
+                        const ingCostHist = costHistory.filter((ch) => ch.ingredient_id === row.ingredient_id)
+                        if (ingCostHist.length === 0) return null
+                        return (
+                          <div className="rounded-lg border border-blue-500/30 bg-blue-500/5 overflow-hidden">
+                            <p className="px-4 py-2 text-[10px] font-medium uppercase tracking-wider text-blue-400 border-b border-blue-500/30">
+                              PO Processing History — {row.name} ({ingCostHist.length} entries)
+                            </p>
+                            <table className="w-full text-xs">
+                              <thead>
+                                <tr className="border-b border-blue-500/20 text-muted">
+                                  <th className="px-3 py-1.5 text-left font-medium">PO #</th>
+                                  <th className="px-3 py-1.5 text-right font-medium">Qty Added</th>
+                                  <th className="px-3 py-1.5 text-right font-medium">Unit Cost</th>
+                                  <th className="px-3 py-1.5 text-left font-medium">Date</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {ingCostHist.map((ch: any) => (
+                                  <tr key={ch.id} className="border-b border-blue-500/10 last:border-0">
+                                    <td className="px-3 py-1.5 text-blue-300 font-medium">{ch.purchase_orders?.po_number ?? ch.purchase_order_id?.slice(0, 8)}</td>
+                                    <td className="px-3 py-1.5 text-right font-mono text-text">{fmtNum(Math.round(ch.quantity ?? 0))} {row.unit}</td>
+                                    <td className="px-3 py-1.5 text-right font-mono text-muted">{fmt$(ch.unit_cost ?? 0)}/{row.unit}</td>
+                                    <td className="px-3 py-1.5 text-muted">{ch.date ?? '—'}</td>
+                                  </tr>
+                                ))}
+                                <tr className="bg-blue-500/10">
+                                  <td className="px-3 py-1.5 text-blue-400 font-medium">TOTAL from POs</td>
+                                  <td className="px-3 py-1.5 text-right font-mono text-blue-400 font-medium">
+                                    {fmtNum(Math.round(ingCostHist.reduce((s: number, ch: any) => s + (ch.quantity ?? 0), 0)))} {row.unit}
+                                  </td>
+                                  <td colSpan={2}></td>
+                                </tr>
+                              </tbody>
+                            </table>
+                          </div>
+                        )
+                      })()}
+
+                      {/* Adjustment history */}
+                      {rowAdj.length === 0 ? (
+                        <div className="rounded-lg border border-border bg-surface/30 px-4 py-3 text-xs text-muted">
+                          No adjustment history for {row.name}
+                        </div>
+                      ) : (
+                        <div className="rounded-lg border border-border bg-surface/30 overflow-hidden">
+                          <p className="px-4 py-2 text-[10px] font-medium uppercase tracking-wider text-muted border-b border-border">
+                            Adjustment History — {row.name}
+                          </p>
+                          <table className="w-full text-xs">
+                            <thead>
+                              <tr className="border-b border-border text-muted">
+                                <th className="px-3 py-1.5 text-left font-medium">Date</th>
+                                <th className="px-3 py-1.5 text-right font-medium">Previous</th>
+                                <th className="px-3 py-1.5 text-right font-medium">Actual</th>
+                                <th className="px-3 py-1.5 text-right font-medium">Diff</th>
+                                <th className="px-3 py-1.5 text-left font-medium">Reason</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {rowAdj.slice(0, 10).map((a) => {
+                                const diffColor = (a.difference ?? 0) > 0 ? 'text-green-400' : (a.difference ?? 0) < 0 ? 'text-red-400' : 'text-muted'
+                                return (
+                                  <tr key={a.id} className="border-b border-border last:border-0">
+                                    <td className="px-3 py-1.5 text-muted">{a.created_at ? format(new Date(a.created_at), 'MMM d, yyyy') : '—'}</td>
+                                    <td className="px-3 py-1.5 text-right font-mono text-muted">{a.previous_quantity != null ? fmtNum(Math.round(a.previous_quantity)) : '—'}</td>
+                                    <td className="px-3 py-1.5 text-right font-mono text-text">{a.new_quantity != null ? fmtNum(Math.round(a.new_quantity)) : '—'}</td>
+                                    <td className={`px-3 py-1.5 text-right font-mono font-medium ${diffColor}`}>
+                                      {a.difference != null && a.difference !== 0 ? `${a.difference > 0 ? '+' : ''}${fmtNum(Math.round(a.difference))}` : '—'}
+                                    </td>
+                                    <td className="px-3 py-1.5 text-muted truncate max-w-[200px]" title={a.reason ?? ''}>{a.reason ?? '—'}</td>
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
                     </div>
                   )
                 })()}
@@ -2097,6 +2405,37 @@ export default function CpInventory() {
             </button>
           </div>
         </div>
+      </Modal>
+
+{/* Backfill confirm dialog */}
+      <ConfirmDialog
+        isOpen={showBackfillConfirm}
+        title="Recalculate Inventory from Received POs"
+        message="This will iterate all received POs and apply inventory + cost updates for any that haven't been processed yet. Already-processed POs will be skipped. Continue?"
+        confirmLabel="Run Backfill"
+        danger
+        onConfirm={() => { setShowBackfillConfirm(false); backfillInventory() }}
+        onCancel={() => setShowBackfillConfirm(false)}
+      />
+
+      {/* Backfill progress modal */}
+      <Modal isOpen={backfilling || backfillLog.length > 0} onClose={() => { if (!backfilling) setBackfillLog([]) }} title="Backfill Progress">
+        <div className="max-h-80 overflow-y-auto space-y-1 font-mono text-xs text-text-secondary">
+          {backfillLog.map((line, i) => (
+            <p key={i}>{line}</p>
+          ))}
+          {backfilling && <p className="animate-pulse">Processing...</p>}
+        </div>
+        {!backfilling && backfillLog.length > 0 && (
+          <div className="flex justify-end border-t border-border pt-4 mt-4">
+            <button
+              onClick={() => setBackfillLog([])}
+              className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-text transition-colors hover:bg-hover"
+            >
+              Close
+            </button>
+          </div>
+        )}
       </Modal>
     </div>
   )

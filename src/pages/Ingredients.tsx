@@ -7,7 +7,7 @@ import { sanitize } from '../lib/sanitizePayload'
 import { safeBatch } from '../lib/safeQuery'
 import { safeLoad } from '../lib/safeLoad'
 import { fmt$, fmtRate, fmtNum, fmtDate } from '../lib/format'
-import { unitGroup, loadConversions, getConversionFactorWithDensity, type ConversionMap } from '../lib/conversions'
+import { unitGroup, normalizeUnit, loadConversions, getConversionFactorWithDensity, type ConversionMap } from '../lib/conversions'
 import { downloadCSV } from '../lib/csv'
 import { useToast } from '../components/Toast'
 import PageHeader from '../components/PageHeader'
@@ -21,7 +21,7 @@ import CostGuard from '../components/CostGuard'
 import HelpTip from '../components/HelpTip'
 import Tooltip from '../components/Tooltip'
 import { PageSkeleton } from '../components/Skeleton'
-import { Plus, Download, Pencil, Trash2, Tag, X, Settings } from 'lucide-react'
+import { Plus, Download, Pencil, Trash2, Tag, X, Settings, RefreshCw } from 'lucide-react'
 import type {
   Ingredient,
   IngredientInventory,
@@ -38,6 +38,17 @@ interface CostHistoryWithPO extends IngredientCostHistory {
     supplier_id: string
     suppliers: { name: string } | null
   }
+}
+
+/** Unified purchase history entry (from cost_history table OR po_items fallback) */
+interface PurchaseHistoryEntry {
+  id: string
+  date: string
+  poNumber: string
+  supplier: string
+  quantity: number
+  unitCost: number
+  purchaseOrderId: string
 }
 
 const CATEGORIES = [
@@ -100,6 +111,7 @@ export default function Ingredients() {
   const [loading, setLoading] = useState(true)
   const [detailRow, setDetailRow] = useState<Row | null>(null)
   const [costHistory, setCostHistory] = useState<CostHistoryWithPO[]>([])
+  const [purchaseHistory, setPurchaseHistory] = useState<PurchaseHistoryEntry[]>([])
   const [historyLoading, setHistoryLoading] = useState(false)
   const [conversions, setConversions] = useState<ConversionMap>(new Map())
   const [tags, setTags] = useState<IngredientTag[]>([])
@@ -339,30 +351,31 @@ export default function Ingredients() {
       },
       {
         label: (
-          <HelpTip text="Weighted average cost — automatically recalculated each time a purchase order is received. Click any ingredient row for the full cost breakdown and purchase history.">
-            Avg Cost
+          <HelpTip text="Weighted average cost per unit — recalculated when POs are received. Last cost shown below if different.">
+            Cost/Unit
           </HelpTip>
         ),
         key: 'unit_cost',
         align: 'right',
-        width: '120px',
-        render: (row) => (
-          <CostGuard><span className="font-mono text-muted">{fmtRate(row.unit_cost)}</span></CostGuard>
-        ),
-      },
-      {
-        label: (
-          <HelpTip text="The price paid on your most recent purchase order for this ingredient.">
-            Last Cost
-          </HelpTip>
-        ),
-        key: 'last_cost',
-        align: 'right',
-        width: '110px',
+        width: '130px',
         render: (row) => {
-          if (row.last_cost == null) return <span className="text-muted">—</span>
-          const color = row.last_cost < row.unit_cost ? '#22C55E' : row.last_cost > row.unit_cost ? '#EF4444' : undefined
-          return <CostGuard><span className="font-mono" style={{ color }}>{fmtRate(row.last_cost)}</span></CostGuard>
+          if (!row.unit_cost) return <span className="text-muted">—</span>
+          const same = row.last_cost != null && Math.abs(row.last_cost - row.unit_cost) < 0.0001
+          const lastColor = row.last_cost != null
+            ? row.last_cost > row.unit_cost ? '#EF4444' : row.last_cost < row.unit_cost ? '#22C55E' : undefined
+            : undefined
+          return (
+            <CostGuard>
+              <div>
+                <span className="font-mono text-text">{fmtRate(row.unit_cost)}<span className="text-muted text-[11px]">/{row.unit}</span></span>
+                {row.last_cost != null && !same && (
+                  <div className="font-mono text-[11px]" style={{ color: lastColor }}>
+                    {fmtRate(row.last_cost)}/{row.unit} <span className="text-muted font-sans">(last)</span>
+                  </div>
+                )}
+              </div>
+            </CostGuard>
+          )
         },
       },
       {
@@ -434,13 +447,181 @@ export default function Ingredients() {
   async function openDetail(row: Row) {
     setDetailRow(row)
     setHistoryLoading(true)
-    const { data } = await supabase
+
+    // Primary: cost history table
+    const { data: chData } = await supabase
       .from('ingredient_cost_history')
       .select('*, purchase_orders!inner(po_number, supplier_id, suppliers(name))')
       .eq('ingredient_id', row.id)
       .order('date', { ascending: false })
-    setCostHistory((data as CostHistoryWithPO[] | null) ?? [])
+    const costHistoryRows = (chData as CostHistoryWithPO[] | null) ?? []
+    setCostHistory(costHistoryRows)
+
+    // Fallback: get directly from PO items (covers POs received before cost history tracking)
+    const { data: poItemData } = await supabase
+      .from('purchase_order_items')
+      .select('id, quantity, received_quantity, unit_cost, quantity_unit, purchase_order_id, purchase_orders(id, po_number, status, order_date, supplier_id, suppliers(name))')
+      .eq('ingredient_id', row.id)
+
+    // Merge — deduplicate by purchase_order_id
+    const seenPOs = new Set(costHistoryRows.map((ch) => ch.purchase_order_id))
+    const merged: PurchaseHistoryEntry[] = []
+
+    // Add cost history records first (already in ingredient units from when PO was received)
+    for (const ch of costHistoryRows) {
+      // If cost history has quantity=0, it was saved with the received_quantity bug — skip it so fallback picks it up
+      if (ch.quantity <= 0) { continue }
+      merged.push({
+        id: ch.id,
+        date: ch.date,
+        poNumber: ch.purchase_orders.po_number,
+        supplier: ch.purchase_orders.suppliers?.name ?? '—',
+        quantity: ch.quantity,
+        unitCost: ch.unit_cost,
+        purchaseOrderId: ch.purchase_order_id,
+      })
+    }
+
+    // Add PO items not already in cost history (only from non-draft/cancelled POs)
+    // Converts to ingredient's unit using conversions
+    type POItemRow = { id: string; quantity: number; received_quantity: number | null; unit_cost: number; quantity_unit: string | null; purchase_order_id: string; purchase_orders: { id: string; po_number: string; status: string; order_date: string | null; supplier_id: string; suppliers: { name: string } | null } | null }
+    const skipStatuses = new Set(['draft', 'cancelled'])
+    const ingUnit = row.unit
+    for (const item of (poItemData as POItemRow[] | null) ?? []) {
+      const po = item.purchase_orders
+      if (!po || skipStatuses.has(po.status) || seenPOs.has(po.id)) continue
+      seenPOs.add(po.id)
+
+      // Use quantity (ordered), not received_quantity (may be 0)
+      const rawQty = (item.received_quantity != null && item.received_quantity > 0) ? item.received_quantity : item.quantity
+      if (rawQty <= 0) continue
+      const lineUnit = item.quantity_unit ?? ingUnit
+
+      // Convert to ingredient's unit
+      let qty = rawQty
+      let cost = item.unit_cost
+      if (normalizeUnit(lineUnit) !== normalizeUnit(ingUnit)) {
+        try {
+          const factor = getConversionFactorWithDensity(conversions, lineUnit, ingUnit, row.density_g_per_ml)
+          qty = Math.round(rawQty * factor * 10000) / 10000
+          cost = Math.round((item.unit_cost / factor) * 10000) / 10000
+        } catch {
+          // Conversion not available — show in original units
+        }
+      }
+
+      merged.push({
+        id: item.id,
+        date: po.order_date ?? '',
+        poNumber: po.po_number,
+        supplier: po.suppliers?.name ?? '—',
+        quantity: qty,
+        unitCost: cost,
+        purchaseOrderId: po.id,
+      })
+    }
+
+    // Sort by date descending
+    merged.sort((a, b) => b.date.localeCompare(a.date))
+    setPurchaseHistory(merged)
     setHistoryLoading(false)
+  }
+
+  /** Recalculate an ingredient's avg cost and last cost from all received PO items */
+  async function recalcIngredientCost(ingredientId: string, ingUnit: string, density: number | null): Promise<{ avgCost: number; lastCost: number; count: number } | null> {
+    const { data: poItems } = await supabase
+      .from('purchase_order_items')
+      .select('quantity, received_quantity, unit_cost, quantity_unit, purchase_order_id, purchase_orders(id, status, order_date)')
+      .eq('ingredient_id', ingredientId)
+
+    if (!poItems || poItems.length === 0) return null
+
+    type PIRow = { quantity: number; received_quantity: number | null; unit_cost: number; quantity_unit: string | null; purchase_order_id: string; purchase_orders: { id: string; status: string; order_date: string | null } | null }
+    const received = (poItems as PIRow[]).filter((pi) => {
+      const st = pi.purchase_orders?.status
+      return st && st !== 'draft' && st !== 'cancelled'
+    })
+    if (received.length === 0) return null
+
+    // Sort by order_date ascending so last item = most recent
+    received.sort((a, b) => (a.purchase_orders?.order_date ?? '').localeCompare(b.purchase_orders?.order_date ?? ''))
+
+    let totalQty = 0
+    let totalValue = 0
+    let lastCost = 0
+
+    for (const pi of received) {
+      const rawQty = (pi.received_quantity != null && pi.received_quantity > 0) ? pi.received_quantity : pi.quantity
+      if (rawQty <= 0) continue
+      const lineUnit = pi.quantity_unit ?? ingUnit
+
+      let qty = rawQty
+      let cost = pi.unit_cost
+      if (normalizeUnit(lineUnit) !== normalizeUnit(ingUnit)) {
+        try {
+          const factor = getConversionFactorWithDensity(conversions, lineUnit, ingUnit, density)
+          qty = Math.round(rawQty * factor * 10000) / 10000
+          cost = Math.round((pi.unit_cost / factor) * 10000) / 10000
+        } catch { /* use unconverted */ }
+      }
+
+      totalQty += qty
+      totalValue += qty * cost
+      lastCost = cost
+    }
+
+    if (totalQty <= 0) return null
+    return { avgCost: Math.round((totalValue / totalQty) * 10000) / 10000, lastCost, count: received.length }
+  }
+
+  /** Recalculate and save cost for a single ingredient, then refresh */
+  async function recalcSingleIngredient(ingredientId: string, ingUnit: string, density: number | null) {
+    setSaving(true)
+    try {
+      const result = await recalcIngredientCost(ingredientId, ingUnit, density)
+      if (!result) { toast.info('No received PO items found for this ingredient'); setSaving(false); return }
+      await dbUpdate('ingredients', sanitize('ingredients', {
+        unit_cost: result.avgCost,
+        last_cost: result.lastCost,
+        updated_at: new Date().toISOString(),
+      }), 'id', ingredientId)
+      toast.success(`Cost updated: avg ${fmtRate(result.avgCost)}/${ingUnit}, last ${fmtRate(result.lastCost)}/${ingUnit}`)
+      // Update detail row in place so the popup refreshes immediately
+      setDetailRow((prev) => prev ? { ...prev, unit_cost: result.avgCost, last_cost: result.lastCost } : null)
+      load() // refresh table in background
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Recalculation failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  /** Bulk recalculate all ingredient costs */
+  const [bulkRecalcProgress, setBulkRecalcProgress] = useState<string | null>(null)
+  async function bulkRecalcCosts() {
+    setBulkRecalcProgress('Starting...')
+    let updated = 0
+    try {
+      for (let i = 0; i < ingredients.length; i++) {
+        const ing = ingredients[i]
+        setBulkRecalcProgress(`${i + 1}/${ingredients.length} — ${ing.name}`)
+        const result = await recalcIngredientCost(ing.id, ing.unit, ing.density_g_per_ml ?? null)
+        if (result) {
+          await dbUpdate('ingredients', sanitize('ingredients', {
+            unit_cost: result.avgCost,
+            last_cost: result.lastCost,
+            updated_at: new Date().toISOString(),
+          }), 'id', ing.id)
+          updated++
+        }
+      }
+      toast.success(`Updated costs for ${updated} ingredient${updated !== 1 ? 's' : ''} with purchase history`)
+      await load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Bulk recalculation failed')
+    } finally {
+      setBulkRecalcProgress(null)
+    }
   }
 
   async function handleCreate(e: FormEvent<HTMLFormElement>) {
@@ -610,6 +791,15 @@ export default function Ingredients() {
     <div>
       <PageHeader title="Ingredients" subtitle="Inventory levels across all locations">
         <button
+          onClick={bulkRecalcCosts}
+          disabled={!!bulkRecalcProgress}
+          className="flex items-center gap-2 rounded-lg border border-border px-3 py-2 text-sm text-muted transition-colors hover:text-text disabled:opacity-50"
+          title="Recalculate all ingredient costs from purchase history"
+        >
+          <RefreshCw size={14} className={bulkRecalcProgress ? 'animate-spin' : ''} />
+          {bulkRecalcProgress ?? 'Recalculate Costs'}
+        </button>
+        <button
           onClick={handleExportCSV}
           className="flex items-center gap-2 rounded-lg border border-border px-4 py-2 text-sm text-muted transition-colors hover:text-text"
         >
@@ -716,8 +906,15 @@ export default function Ingredients() {
           }
           runningAvgs.reverse()
 
-          const lastPurchase = costHistory.length > 0 ? costHistory[0] : null
-          const totalValue = detailRow.totalOwned * detailRow.unit_cost
+          const lastPurchase = purchaseHistory.length > 0 ? purchaseHistory[0] : null
+
+          // Live cost calculation from purchase history (more reliable than DB values that may be stale)
+          const phTotalQty = purchaseHistory.reduce((s, h) => s + h.quantity, 0)
+          const phTotalValue = purchaseHistory.reduce((s, h) => s + h.quantity * h.unitCost, 0)
+          const liveAvgCost = phTotalQty > 0 ? phTotalValue / phTotalQty : detailRow.unit_cost
+          const liveLastCost = lastPurchase ? lastPurchase.unitCost : detailRow.last_cost
+          const displayAvgCost = purchaseHistory.length > 0 ? liveAvgCost : detailRow.unit_cost
+          const totalValue = detailRow.totalOwned * displayAvgCost
 
           // Density-based equivalent costs
           const baseGroup = unitGroup(detailRow.unit)
@@ -748,13 +945,26 @@ export default function Ingredients() {
               {/* Cost summary */}
               <div className="grid grid-cols-2 gap-4">
                 <div className="rounded-lg border border-border bg-surface p-3">
-                  <p className="text-[10px] uppercase tracking-wider text-muted">Avg Cost (Weighted)</p>
-                  <p className="mt-1 font-mono text-lg font-semibold text-text">{fmtRate(detailRow.unit_cost)}<span className="text-xs text-muted">/{detailRow.unit}</span></p>
+                  <div className="flex items-center justify-between">
+                    <p className="text-[10px] uppercase tracking-wider text-muted">Avg Cost (Weighted)</p>
+                    {purchaseHistory.length > 0 && (
+                      <button
+                        onClick={() => recalcSingleIngredient(detailRow.id, detailRow.unit, detailRow.density_g_per_ml)}
+                        className="flex items-center gap-1 text-[10px] text-muted hover:text-accent transition-colors"
+                        title="Recalculate from purchase history"
+                        disabled={saving}
+                      >
+                        <RefreshCw size={10} />
+                        Recalc
+                      </button>
+                    )}
+                  </div>
+                  <p className="mt-1 font-mono text-lg font-semibold text-text">{fmtRate(displayAvgCost)}<span className="text-xs text-muted">/{detailRow.unit}</span></p>
                 </div>
                 <div className="rounded-lg border border-border bg-surface p-3">
                   <p className="text-[10px] uppercase tracking-wider text-muted">Last Purchase Cost</p>
-                  <p className="mt-1 font-mono text-lg font-semibold" style={{ color: detailRow.last_cost != null && detailRow.last_cost < detailRow.unit_cost ? '#22C55E' : detailRow.last_cost != null && detailRow.last_cost > detailRow.unit_cost ? '#EF4444' : 'var(--color-text)' }}>
-                    {detailRow.last_cost != null ? fmtRate(detailRow.last_cost) : '—'}<span className="text-xs text-muted">/{detailRow.unit}</span>
+                  <p className="mt-1 font-mono text-lg font-semibold" style={{ color: liveLastCost != null && liveLastCost < displayAvgCost ? '#22C55E' : liveLastCost != null && liveLastCost > displayAvgCost ? '#EF4444' : 'var(--color-text)' }}>
+                    {liveLastCost != null ? fmtRate(liveLastCost) : '—'}<span className="text-xs text-muted">/{detailRow.unit}</span>
                   </p>
                 </div>
               </div>
@@ -767,7 +977,7 @@ export default function Ingredients() {
                     How This Cost Is Calculated
                   </p>
 
-                  {costHistory.length > 0 ? (
+                  {purchaseHistory.length > 0 ? (
                     <div className="space-y-3 text-xs text-muted">
                       <p>
                         This cost uses the <span className="font-medium text-text">Weighted Average</span> method:
@@ -783,10 +993,10 @@ export default function Ingredients() {
                         <p className="text-[10px] font-medium uppercase tracking-wider text-muted mb-1">Current Calculation</p>
                         <p>Total quantity owned: <span className="font-mono text-accent">{fmtNum(Math.round(detailRow.totalOwned))} {detailRow.unit}</span></p>
                         <p>Total value: <span className="font-mono text-accent">{fmt$(totalValue)}</span></p>
-                        <p>Weighted average cost: <span className="font-mono text-accent">{fmtRate(detailRow.unit_cost)}</span> per {detailRow.unit}</p>
+                        <p>Weighted average cost: <span className="font-mono text-accent">{fmtRate(displayAvgCost)}</span> per {detailRow.unit}</p>
                         {lastPurchase && (
-                          <p>Last purchase price: <span className="font-mono text-accent">{fmtRate(lastPurchase.unit_cost)}</span> per {detailRow.unit}{' '}
-                            <span className="text-muted">({lastPurchase.purchase_orders.po_number}, {fmtDate(lastPurchase.date)})</span>
+                          <p>Last purchase price: <span className="font-mono text-accent">{fmtRate(lastPurchase.unitCost)}</span> per {detailRow.unit}{' '}
+                            <span className="text-muted">({lastPurchase.poNumber}, {lastPurchase.date ? fmtDate(lastPurchase.date) : '—'})</span>
                           </p>
                         )}
                       </div>
@@ -854,37 +1064,50 @@ export default function Ingredients() {
                 <p className="mb-2 text-xs font-medium uppercase tracking-wider text-muted">Purchase History</p>
                 {historyLoading ? (
                   <p className="text-sm text-muted">Loading...</p>
-                ) : costHistory.length === 0 ? (
+                ) : purchaseHistory.length === 0 ? (
                   <p className="text-xs text-muted">
-                    No purchase history yet — cost will be tracked automatically when purchase orders are received.
+                    No purchase history yet — costs will appear when POs are received.
                   </p>
                 ) : (
-                  <div className="max-h-64 overflow-y-auto rounded-lg border border-border">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="border-b border-border bg-surface/50 text-left">
-                          <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium">Date</th>
-                          <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium">PO #</th>
-                          <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium">Supplier</th>
-                          <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium text-right">Qty</th>
-                          <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium text-right">Price Paid</th>
-                          <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium text-right">Avg After</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {costHistory.map((ch, idx) => (
-                          <tr key={ch.id} className="border-b border-border last:border-0">
-                            <td className="px-3 py-2 text-muted">{fmtDate(ch.date)}</td>
-                            <td className="px-3 py-2 font-mono text-text">{ch.purchase_orders.po_number}</td>
-                            <td className="px-3 py-2 text-text">{ch.purchase_orders.suppliers?.name ?? '—'}</td>
-                            <td className="px-3 py-2 text-right font-mono text-text">{fmtNum(ch.quantity)} {detailRow.unit}</td>
-                            <td className="px-3 py-2 text-right font-mono text-text">{fmtRate(ch.unit_cost)}/{detailRow.unit}</td>
-                            <td className="px-3 py-2 text-right font-mono text-accent">{fmtRate(runningAvgs[idx])}</td>
+                  <>
+                    <div className="max-h-64 overflow-y-auto rounded-lg border border-border">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="border-b border-border bg-surface/50 text-left">
+                            <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium">Date</th>
+                            <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium">PO #</th>
+                            <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium">Supplier</th>
+                            <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium text-right">Qty</th>
+                            <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium text-right">Unit Cost</th>
+                            <th className="px-3 py-2 text-[10px] uppercase tracking-wider text-muted font-medium text-right">Total</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                        </thead>
+                        <tbody>
+                          {purchaseHistory.map((h) => (
+                            <tr key={h.id} className="border-b border-border last:border-0">
+                              <td className="px-3 py-2 text-muted">{h.date ? fmtDate(h.date) : '—'}</td>
+                              <td className="px-3 py-2 font-mono text-accent">{h.poNumber}</td>
+                              <td className="px-3 py-2 text-text">{h.supplier}</td>
+                              <td className="px-3 py-2 text-right font-mono text-text">{fmtNum(h.quantity)} {detailRow.unit}</td>
+                              <td className="px-3 py-2 text-right font-mono text-text">{fmtRate(h.unitCost)}/{detailRow.unit}</td>
+                              <td className="px-3 py-2 text-right font-mono text-text">{fmt$(h.quantity * h.unitCost)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    {/* Summary */}
+                    {(() => {
+                      const totalQty = purchaseHistory.reduce((s, h) => s + h.quantity, 0)
+                      const totalSpent = purchaseHistory.reduce((s, h) => s + h.quantity * h.unitCost, 0)
+                      return (
+                        <div className="mt-2 flex items-center gap-4 text-xs text-muted">
+                          <span>Total purchased: <span className="font-mono text-text">{fmtNum(Math.round(totalQty))} {detailRow.unit}</span> across {purchaseHistory.length} PO{purchaseHistory.length !== 1 ? 's' : ''}</span>
+                          <span>Total spent: <span className="font-mono text-text">{fmt$(totalSpent)}</span></span>
+                        </div>
+                      )
+                    })()}
+                  </>
                 )}
               </div>
             </div>
