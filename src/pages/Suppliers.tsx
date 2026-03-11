@@ -16,7 +16,7 @@ import Modal from '../components/Modal'
 import ConfirmDialog from '../components/ConfirmDialog'
 import { PageSkeleton } from '../components/Skeleton'
 import { useToast } from '../components/Toast'
-import { Plus, Star, Mail, Clock, CreditCard, Trash2, Download, Upload, X, Pencil, PackageSearch, FileDown, Printer, ChevronDown } from 'lucide-react'
+import { Plus, Star, Mail, Clock, CreditCard, Trash2, Download, Upload, X, Pencil, PackageSearch, FileDown, Printer, ChevronDown, Paperclip } from 'lucide-react'
 import Papa from 'papaparse'
 import { generatePO_PDF, type POPDFData } from '../lib/generatePO_PDF'
 import SearchInput from '../components/SearchInput'
@@ -239,6 +239,7 @@ interface PORow extends Record<string, unknown> {
   card_used: string | null
   amount_paid: number
   production_order_id: string | null
+  attachment_count: number
 }
 
 /* ────────── line-item state for the create modal ────────── */
@@ -311,6 +312,7 @@ export default function Suppliers() {
   const [poViewMode, setPOViewMode] = useState<'list' | 'grouped'>('list')
   const [poProdOrderFilter, setPOProdOrderFilter] = useState<string>('all')
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
+  const [poAttachmentCounts, setPOAttachmentCounts] = useState<Map<string, number>>(new Map())
 
   /* modals */
   const [poModalOpen, setPOModalOpen] = useState(false)
@@ -440,6 +442,17 @@ export default function Suppliers() {
     setTags(tagRes.data ?? [])
     setTagLinks(tagLinkRes.data ?? [])
     setConversions(convMap)
+    // Load attachment counts per PO
+    const { data: attRows } = await supabase
+      .from('po_attachments')
+      .select('purchase_order_id')
+    if (attRows) {
+      const counts = new Map<string, number>()
+      for (const r of attRows) {
+        counts.set(r.purchase_order_id, (counts.get(r.purchase_order_id) ?? 0) + 1)
+      }
+      setPOAttachmentCounts(counts)
+    }
     setLoading(false)
   }
 
@@ -625,6 +638,7 @@ export default function Suppliers() {
         card_used: (po as any).card_used ?? null,
         amount_paid: (po as any).amount_paid ?? 0,
         production_order_id: po.production_order_id,
+        attachment_count: poAttachmentCounts.get(po.id) ?? 0,
       }
     })
 
@@ -680,8 +694,13 @@ export default function Suppliers() {
       render: (r) => {
         const meta = ORDER_TYPES.find((t) => t.value === r.order_type) ?? ORDER_TYPES[0]
         return (
-          <span className="text-[14px] font-mono font-semibold text-text">
+          <span className="inline-flex items-center gap-1 text-[14px] font-mono font-semibold text-text">
             <span title={meta.label}>{meta.icon}</span> {r.po_number}
+            {r.attachment_count > 0 && (
+              <span className="text-muted" title={`${r.attachment_count} attachment${r.attachment_count > 1 ? 's' : ''}`}>
+                <Paperclip size={12} />
+              </span>
+            )}
           </span>
         )
       },
