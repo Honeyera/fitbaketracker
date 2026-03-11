@@ -672,7 +672,7 @@ export default function Dashboard() {
     const method = quickPayMethod[po.id] || ''
     const fee = method === 'Melio' ? po.balance * MELIO_FEE_PCT : 0
     return (
-      <div className="ml-3 flex shrink-0 items-center gap-1.5">
+      <div className="flex shrink-0 items-center justify-end gap-1.5">
         <select
           value={method}
           onChange={(e) => setQuickPayMethod((prev) => ({ ...prev, [po.id]: e.target.value }))}
@@ -911,118 +911,153 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                {/* Overdue section */}
-                {overdueRows.length > 0 && (
-                  <>
-                    <div className="px-5 py-1.5">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-red-400">Overdue</p>
-                    </div>
-                    <div className="divide-y divide-border">
+                {/* Payment rows table */}
+                <table className="w-full text-left text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-[10px] font-semibold uppercase tracking-wider text-muted">
+                      <th className="px-5 py-2 font-semibold" style={{ width: 100 }}>PO #</th>
+                      <th className="px-3 py-2 font-semibold">Supplier</th>
+                      <th className="px-3 py-2 font-semibold text-right" style={{ width: 100 }}>Balance</th>
+                      <th className="px-3 py-2 font-semibold" style={{ width: 100 }}>Due Date</th>
+                      <th className="px-3 py-2 font-semibold" style={{ width: 110 }}>Status</th>
+                      <th className="px-3 py-2 font-semibold text-center" style={{ width: 50 }} />
+                      <th className="px-3 py-2 font-semibold text-right" style={{ width: 220 }}>Action</th>
+                    </tr>
+                  </thead>
+
+                  {/* Overdue section */}
+                  {overdueRows.length > 0 && (
+                    <tbody>
+                      <tr><td colSpan={7} className="px-5 pt-3 pb-1"><p className="text-[10px] font-semibold uppercase tracking-wider text-red-400">Overdue</p></td></tr>
                       {overdueRows.map((po) => (
-                        <div key={po.id} className="flex items-center justify-between px-5 py-2.5 border-l-2 border-l-red-500">
-                          <div className="flex items-center gap-4 min-w-0">
+                        <tr key={po.id} className="border-t border-border/50 hover:bg-surface/30">
+                          <td className="px-5 py-2.5 border-l-2 border-l-red-500">
                             <span className="font-mono text-xs font-medium text-text">{po.po_number}</span>
-                            <span className="truncate text-xs text-muted">{po.supplier_name}</span>
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="text-xs text-text">{po.supplier_name}</span>
+                          </td>
+                          <td className="px-3 py-2.5 text-right">
                             <span className="font-mono text-xs font-semibold text-text">{fmt$(po.balance)}</span>
-                            <span className="text-xs text-muted">Due {fmtDate(po.payment_due_date)}</span>
-                            <span className="flex items-center gap-1 text-xs font-medium text-red-400">
-                              <AlertTriangle size={12} />
-                              {Math.abs(po.days_relative)} day{Math.abs(po.days_relative) !== 1 ? 's' : ''} late
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="text-xs text-muted">{fmtDate(po.payment_due_date)}</span>
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="inline-flex items-center gap-1 rounded-full bg-red-500/15 px-2 py-0.5 text-[11px] font-medium text-red-400">
+                              <AlertTriangle size={10} />
+                              {Math.abs(po.days_relative)}d late
                             </span>
+                          </td>
+                          <td className="px-3 py-2.5 text-center">
                             {poInvoiceUrls.has(po.id) && (
                               <a
                                 href={poInvoiceUrls.get(po.id)}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 title="View Invoice"
-                                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent transition-colors hover:bg-accent/10"
-                                onClick={(e) => e.stopPropagation()}
+                                className="inline-flex items-center rounded p-1 text-muted transition-colors hover:text-accent hover:bg-accent/10"
                               >
-                                <FileText size={12} />
-                                Invoice
+                                <FileText size={14} />
                               </a>
                             )}
-                          </div>
-                          <QuickPayAction po={po} />
-                        </div>
+                          </td>
+                          <td className="px-3 py-2.5 text-right">
+                            <QuickPayAction po={po} />
+                          </td>
+                        </tr>
                       ))}
-                    </div>
-                  </>
-                )}
+                    </tbody>
+                  )}
 
-                {/* Due This Week section */}
-                {thisWeekRows.length > 0 && (
-                  <>
-                    <div className="px-5 py-1.5">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-amber-400">Due This Week</p>
-                    </div>
-                    <div className="divide-y divide-border">
+                  {/* Due This Week section */}
+                  {thisWeekRows.length > 0 && (
+                    <tbody>
+                      <tr><td colSpan={7} className="px-5 pt-3 pb-1"><p className="text-[10px] font-semibold uppercase tracking-wider text-amber-400">Due This Week</p></td></tr>
                       {thisWeekRows.map((po) => (
-                        <div key={po.id} className="flex items-center justify-between px-5 py-2.5 border-l-2 border-l-amber-500">
-                          <div className="flex items-center gap-4 min-w-0">
+                        <tr key={po.id} className="border-t border-border/50 hover:bg-surface/30">
+                          <td className="px-5 py-2.5 border-l-2 border-l-amber-500">
                             <span className="font-mono text-xs font-medium text-text">{po.po_number}</span>
-                            <span className="truncate text-xs text-muted">{po.supplier_name}</span>
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="text-xs text-text">{po.supplier_name}</span>
+                          </td>
+                          <td className="px-3 py-2.5 text-right">
                             <span className="font-mono text-xs font-semibold text-text">{fmt$(po.balance)}</span>
-                            <span className="text-xs text-muted">Due {fmtDate(po.payment_due_date)}</span>
-                            <span className="text-xs text-muted">
-                              {po.days_relative === 0 ? 'today' : `in ${po.days_relative} day${po.days_relative !== 1 ? 's' : ''}`}
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="text-xs text-muted">{fmtDate(po.payment_due_date)}</span>
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-400">
+                              {po.days_relative === 0 ? 'Today' : `${po.days_relative}d left`}
                             </span>
+                          </td>
+                          <td className="px-3 py-2.5 text-center">
                             {poInvoiceUrls.has(po.id) && (
                               <a
                                 href={poInvoiceUrls.get(po.id)}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 title="View Invoice"
-                                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent transition-colors hover:bg-accent/10"
-                                onClick={(e) => e.stopPropagation()}
+                                className="inline-flex items-center rounded p-1 text-muted transition-colors hover:text-accent hover:bg-accent/10"
                               >
-                                <FileText size={12} />
-                                Invoice
+                                <FileText size={14} />
                               </a>
                             )}
-                          </div>
-                          <QuickPayAction po={po} />
-                        </div>
+                          </td>
+                          <td className="px-3 py-2.5 text-right">
+                            <QuickPayAction po={po} />
+                          </td>
+                        </tr>
                       ))}
-                    </div>
-                  </>
-                )}
+                    </tbody>
+                  )}
 
-                {/* Upcoming section */}
-                {upcomingRows.length > 0 && (
-                  <>
-                    <div className="px-5 py-1.5">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-green-400">Upcoming (next 30 days)</p>
-                    </div>
-                    <div className="divide-y divide-border">
+                  {/* Upcoming section */}
+                  {upcomingRows.length > 0 && (
+                    <tbody>
+                      <tr><td colSpan={7} className="px-5 pt-3 pb-1"><p className="text-[10px] font-semibold uppercase tracking-wider text-green-400">Upcoming (30 days)</p></td></tr>
                       {upcomingRows.map((po) => (
-                        <div key={po.id} className="flex items-center justify-between px-5 py-2.5">
-                          <div className="flex items-center gap-4 min-w-0">
+                        <tr key={po.id} className="border-t border-border/50 hover:bg-surface/30">
+                          <td className="px-5 py-2.5">
                             <span className="font-mono text-xs font-medium text-text">{po.po_number}</span>
-                            <span className="truncate text-xs text-muted">{po.supplier_name}</span>
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="text-xs text-text">{po.supplier_name}</span>
+                          </td>
+                          <td className="px-3 py-2.5 text-right">
                             <span className="font-mono text-xs font-semibold text-text">{fmt$(po.balance)}</span>
-                            <span className="text-xs text-muted">Due {fmtDate(po.payment_due_date)}</span>
-                            <span className="text-xs text-muted">in {po.days_relative} days</span>
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="text-xs text-muted">{fmtDate(po.payment_due_date)}</span>
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <span className="inline-flex items-center gap-1 rounded-full bg-green-500/15 px-2 py-0.5 text-[11px] font-medium text-green-400">
+                              {po.days_relative}d left
+                            </span>
+                          </td>
+                          <td className="px-3 py-2.5 text-center">
                             {poInvoiceUrls.has(po.id) && (
                               <a
                                 href={poInvoiceUrls.get(po.id)}
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 title="View Invoice"
-                                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent transition-colors hover:bg-accent/10"
-                                onClick={(e) => e.stopPropagation()}
+                                className="inline-flex items-center rounded p-1 text-muted transition-colors hover:text-accent hover:bg-accent/10"
                               >
-                                <FileText size={12} />
-                                Invoice
+                                <FileText size={14} />
                               </a>
                             )}
-                          </div>
-                          <QuickPayAction po={po} />
-                        </div>
+                          </td>
+                          <td className="px-3 py-2.5 text-right">
+                            <QuickPayAction po={po} />
+                          </td>
+                        </tr>
                       ))}
-                    </div>
-                  </>
-                )}
+                    </tbody>
+                  )}
+                </table>
 
                 {/* Total Outstanding */}
                 <div className={`flex items-center justify-between border-t border-border px-5 py-3 ${overdueRows.length > 0 ? 'bg-red-500/5' : 'bg-surface/30'}`}>
