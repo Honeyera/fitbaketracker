@@ -11,7 +11,7 @@ import Badge from '../components/Badge'
 import RecipeIcon from '../components/RecipeIcon'
 import { PageSkeleton } from '../components/Skeleton'
 import { fmt$, fmtNum, fmtDate } from '../lib/format'
-import { MapPin, AlertTriangle, DollarSign, ChevronDown, Check } from 'lucide-react'
+import { MapPin, AlertTriangle, DollarSign, ChevronDown, Check, FileText } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from '../components/Toast'
 import { dbInsert, dbUpdate } from '../lib/dbWrite'
@@ -71,6 +71,7 @@ export default function Dashboard() {
   const [paymentsDueOpen, setPaymentsDueOpen] = useState(true)
   const [markingPaid, setMarkingPaid] = useState<string | null>(null)
   const [quickPayMethod, setQuickPayMethod] = useState<Record<string, string>>({})
+  const [poInvoiceUrls, setPOInvoiceUrls] = useState<Map<string, string>>(new Map())
 
   const QUICK_PAY_METHODS = ['Wire Transfer', 'ACH', 'Check', 'Credit Card', 'Melio', 'Cash']
   const MELIO_FEE_PCT = 0.029
@@ -111,6 +112,18 @@ export default function Dashboard() {
       setCpInvoices(cpInvRes.data ?? [])
       setCpPayments(cpPayRes.data ?? [])
     } catch { /* invoice tables may not exist yet */ }
+    // Load PO invoice attachments
+    try {
+      const { data: attRows } = await supabase
+        .from('po_attachments')
+        .select('purchase_order_id, file_url')
+        .eq('file_type', 'invoice')
+      if (attRows) {
+        const urlMap = new Map<string, string>()
+        for (const r of attRows) urlMap.set(r.purchase_order_id, r.file_url)
+        setPOInvoiceUrls(urlMap)
+      }
+    } catch { /* po_attachments may not exist yet */ }
     setLoading(false)
   }
 
@@ -916,6 +929,19 @@ export default function Dashboard() {
                               <AlertTriangle size={12} />
                               {Math.abs(po.days_relative)} day{Math.abs(po.days_relative) !== 1 ? 's' : ''} late
                             </span>
+                            {poInvoiceUrls.has(po.id) && (
+                              <a
+                                href={poInvoiceUrls.get(po.id)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title="View Invoice"
+                                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent transition-colors hover:bg-accent/10"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <FileText size={12} />
+                                Invoice
+                              </a>
+                            )}
                           </div>
                           <QuickPayAction po={po} />
                         </div>
@@ -941,6 +967,19 @@ export default function Dashboard() {
                             <span className="text-xs text-muted">
                               {po.days_relative === 0 ? 'today' : `in ${po.days_relative} day${po.days_relative !== 1 ? 's' : ''}`}
                             </span>
+                            {poInvoiceUrls.has(po.id) && (
+                              <a
+                                href={poInvoiceUrls.get(po.id)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title="View Invoice"
+                                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent transition-colors hover:bg-accent/10"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <FileText size={12} />
+                                Invoice
+                              </a>
+                            )}
                           </div>
                           <QuickPayAction po={po} />
                         </div>
@@ -964,6 +1003,19 @@ export default function Dashboard() {
                             <span className="font-mono text-xs font-semibold text-text">{fmt$(po.balance)}</span>
                             <span className="text-xs text-muted">Due {fmtDate(po.payment_due_date)}</span>
                             <span className="text-xs text-muted">in {po.days_relative} days</span>
+                            {poInvoiceUrls.has(po.id) && (
+                              <a
+                                href={poInvoiceUrls.get(po.id)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title="View Invoice"
+                                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent transition-colors hover:bg-accent/10"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <FileText size={12} />
+                                Invoice
+                              </a>
+                            )}
                           </div>
                           <QuickPayAction po={po} />
                         </div>
