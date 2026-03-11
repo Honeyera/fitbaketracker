@@ -109,6 +109,28 @@ export interface POPaymentInsert {
   status?: string
 }
 
+// ── PO Attachment types (manual until types regen) ──
+export interface POAttachment {
+  id: string
+  purchase_order_id: string
+  file_name: string
+  file_url: string
+  file_type: string
+  file_size: number | null
+  notes: string | null
+  created_at: string
+}
+
+export interface POAttachmentInsert {
+  id?: string
+  purchase_order_id: string
+  file_name: string
+  file_url: string
+  file_type?: string
+  file_size?: number | null
+  notes?: string | null
+}
+
 // ── Insert types (what you pass to an INSERT) ────────────────
 export type CoPackerInsert              = Tables['co_packers']['Insert']
 export type CoPackerContactInsert       = Tables['co_packer_contacts']['Insert']

@@ -25,6 +25,7 @@ import { logActivity } from '../lib/activityLog'
 import CostGuard from '../components/CostGuard'
 import SupplierPopover from '../components/SupplierPopover'
 import POPaymentSection from '../components/POPaymentSection'
+import POAttachments from '../components/POAttachments'
 import CardUsedPicker from '../components/CardUsedPicker'
 import PaymentPopover from '../components/PaymentPopover'
 import type {
@@ -4844,6 +4845,9 @@ When done, save as CSV and send back for import.
                 </div>
               </div>
             </div>
+
+            {/* Attachments */}
+            <POAttachments purchaseOrderId={editPO.id} />
 
             {/* Actions */}
             <div className="flex items-center justify-between border-t border-border pt-4">
